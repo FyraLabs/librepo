@@ -440,8 +440,8 @@ lr_prepare_repomd_xml_file(LrHandle *handle,
  * engine treats the mirror as failed and tries the next mirror
  * (https://github.com/rpm-software-management/librepo/issues/415).
  *
- * On success, repo->signature (validatecb_userdata) is set to the local
- * path of the downloaded repomd.xml.asc.
+ * On success, repo->signature is set to the local path of the
+ * downloaded repomd.xml.asc.
  */
 gboolean
 lr_yum_repomd_gpg_validate(LrDownloadTarget *target,
@@ -449,17 +449,28 @@ lr_yum_repomd_gpg_validate(LrDownloadTarget *target,
                            GError **err)
 {
     LrHandle *handle = target->handle;
-    LrYumRepo *repo = target->validatecb_userdata;
+    LrYumValidateData *data = target->validatecb_userdata;
+    LrYumRepo *repo = data->repo;
+    // The target's GPG home directory wins over the handle's (which
+    // may be shared by multiple targets with different keyrings)
+    const char *gnupghomedir = data->gnupghomedir ? data->gnupghomedir
+                                                 : handle->gnupghomedir;
     GError *tmp_err = NULL;
     gboolean ret;
 
     assert(!err || *err == NULL);
     assert(handle);
+    assert(data);
     assert(repo);
 
     if (!mirror_url) {
-        // The target used a base URL instead of a mirror, there is no
-        // mirror to download the signature from
+        // The target used a base URL instead of a mirror - the pair
+        // stays consistent, the base URL is the only source
+        mirror_url = target->baseurl;
+    }
+    if (!mirror_url) {
+        // No mirror and no base URL - there is nothing to download
+        // the signature from
         g_set_error(err, LR_YUM_ERROR, LRE_BADGPG,
                     "GPG verification is enabled, but the mirror is "
                     "not known, cannot verify repomd.xml");
@@ -477,19 +488,36 @@ lr_yum_repomd_gpg_validate(LrDownloadTarget *target,
         return FALSE;
     }
     char *url = lr_pathconcat(mirror_url, "repodata/repomd.xml.asc", NULL);
-    ret = lr_yum_download_url(handle, url, fd_sig, TRUE, FALSE, &tmp_err);
+    LrCbReturnCode cb_code = LR_CB_OK;
+    ret = lr_yum_download_url(handle, url, fd_sig, TRUE, FALSE, &tmp_err, &cb_code);
     g_free(url);
     close(fd_sig);
     if (!ret) {
         // Error downloading signature
         g_debug("%s: Cannot download repomd.xml.asc from %s: %s",
                 __func__, mirror_url, tmp_err->message);
-        g_set_error(err, LR_YUM_ERROR, LRE_BADGPG,
-                    "GPG verification is enabled, but GPG signature "
-                    "is not available. This may be an error or the "
-                    "repository does not support GPG verification: %s",
-                    tmp_err->message);
-        g_clear_error(&tmp_err);
+        if (tmp_err->code == LRE_INTERRUPTED) {
+            // Do not mask an interrupt as a GPG error
+            g_propagate_error(err, tmp_err);
+        } else if (tmp_err->code == LRE_CBINTERRUPTED ||
+                   (tmp_err->code == LRE_CURL && cb_code == LR_CB_ERROR)) {
+            // The user's callback asked to stop (a progress callback
+            // returning LR_CB_ERROR aborts the nested download and is
+            // reported as a curl abort). Do not mask the cancellation
+            // as a GPG error - the download engine must stop, not
+            // retry the next mirror.
+            g_set_error(err, LR_YUM_ERROR, LRE_CBINTERRUPTED,
+                        "GPG signature download was interrupted by a "
+                        "callback: %s", tmp_err->message);
+            g_clear_error(&tmp_err);
+        } else {
+            g_set_error(err, LR_YUM_ERROR, LRE_BADGPG,
+                        "GPG verification is enabled, but GPG signature "
+                        "is not available. This may be an error or the "
+                        "repository does not support GPG verification: %s",
+                        tmp_err->message);
+            g_clear_error(&tmp_err);
+        }
         unlink(signature);
         g_free(signature);
         return FALSE;
@@ -498,7 +526,7 @@ lr_yum_repomd_gpg_validate(LrDownloadTarget *target,
     // Verify the GPG signature
     char *repomd_path = lr_pathconcat(handle->destdir, target->path, NULL);
     ret = lr_gpg_check_signature(signature, repomd_path,
-                                 handle->gnupghomedir, &tmp_err);
+                                 gnupghomedir, &tmp_err);
     g_free(repomd_path);
     if (!ret) {
         g_debug("%s: GPG signature verification failed from %s: %s",
@@ -568,7 +596,8 @@ lr_get_metadata_failure_callback(const LrHandle *handle)
 
 gboolean
 lr_yum_download_url(LrHandle *lr_handle, const char *url, int fd,
-                    gboolean no_cache, gboolean is_zchunk, GError **err)
+                    gboolean no_cache, gboolean is_zchunk,
+                    GError **err, LrCbReturnCode *cb_return_code)
 {
     gboolean ret;
     LrDownloadTarget *target;
@@ -599,6 +628,9 @@ lr_yum_download_url(LrHandle *lr_handle, const char *url, int fd,
     assert(!(target->err) || !ret);
     if (cbdata)
         cbdata_free(cbdata);
+
+    if (cb_return_code)
+        *cb_return_code = target->cb_return_code;
 
     if (!ret)
         g_propagate_error(err, tmp_err);
@@ -658,8 +690,10 @@ lr_yum_download_repomd(LrHandle *handle,
     // engine - a mirror with a missing or invalid repomd.xml.asc is
     // skipped and the next mirror is tried
     if (handle->checks & LR_CHECK_GPG) {
+        LrYumValidateData *data = g_new0(LrYumValidateData, 1);
+        data->repo = repo;
         target->validatecb = lr_yum_repomd_gpg_validate;
-        target->validatecb_userdata = repo;
+        target->validatecb_userdata = data;
     }
 
     ret = lr_download_target(target, &tmp_err);
@@ -667,6 +701,9 @@ lr_yum_download_repomd(LrHandle *handle,
 
     if (cbdata)
         cbdata_free(cbdata);
+
+    // The callback has run by now - free the per-target data
+    g_free(target->validatecb_userdata);
 
     if (tmp_err) {
         g_propagate_prefixed_error(err, tmp_err,

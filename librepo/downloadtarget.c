@@ -126,6 +126,7 @@ lr_downloadtarget_reset(LrDownloadTarget *target)
     target->effectiveurl = NULL;
     target->rcode = LRE_OK;
     target->err = NULL;
+    target->cb_return_code = LR_CB_OK;
 }
 
 void

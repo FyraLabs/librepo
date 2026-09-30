@@ -777,6 +777,7 @@ class TestCaseYumRepoDownloading(TestCaseWithServer):
 
         self.assertTrue(yum_repo)
         self.assertTrue(yum_repomd)
+        self.assertTrue(yum_repo["signature"])
 
     def test_download_metadata_with_gpg_check_bad_signature_mirror_retry(self):
         # Same as test_download_repo_with_gpg_check_bad_signature_mirror_retry,
@@ -794,6 +795,160 @@ class TestCaseYumRepoDownloading(TestCaseWithServer):
         librepo.download_metadata([target])
 
         self.assertIsNone(target.err)
+
+    def test_download_metadata_with_gpg_check_bad_signature(self):
+        # Regression guard: a single mirror whose repomd.xml.asc does not
+        # verify must still fail through the LrMetadataTarget API, with the
+        # GPG error reported (not LRE_NOURL)
+        h = librepo.Handle()
+
+        url_bad = "%s%s%s" % (self.MOCKURL, config.BADGPG, config.REPO_YUM_01_PATH)
+        h.urls = [url_bad]
+        h.repotype = librepo.LR_YUMREPO
+        h.destdir = self.tmpdir
+        h.gpgcheck = True
+
+        target = librepo.MetadataTarget(h, None, None, None, None, None)
+        librepo.download_metadata([target])
+
+        self.assertIsNotNone(target.err)
+        self.assertTrue(any("GPG" in e for e in target.err), target.err)
+
+    def test_download_repo_with_gpg_check_cancel_during_signature_download(self):
+        # A progress callback returning LR_CB_ERROR during the
+        # repomd.xml.asc download must abort the whole download -
+        # the cancellation must not be converted into a retryable
+        # GPG failure and retried on the next mirror
+        # (https://github.com/rpm-software-management/librepo/issues/415)
+        h = librepo.Handle()
+        r = librepo.Result()
+
+        # Two mirrors so that a (wrong) retry would succeed
+        url = "%s%s" % (self.MOCKURL, config.REPO_YUM_01_PATH)
+        h.urls = [url, url]
+        h.repotype = librepo.LR_YUMREPO
+        h.destdir = self.tmpdir
+        h.gpgcheck = True
+        h.yumdlist = []
+        # The size of repo_yum_01/repodata/repomd.xml.asc
+        state = {'aborted': False}
+        def progress(data, total, now):
+            if total == 488 and not state['aborted']:
+                state['aborted'] = True
+                return librepo.LR_CB_ERROR
+            return librepo.LR_CB_OK
+        h.progresscb = progress
+
+        try:
+            h.perform(r)
+            self.fail("The download should have been aborted by the "
+                      "progress callback")
+        except librepo.LibrepoException as e:
+            self.assertTrue(state['aborted'])
+            self.assertEqual(e.args[0], librepo.LRE_CBINTERRUPTED)
+
+    def test_download_metadata_with_gpg_check_concurrent_slow_signature(self):
+        # A slow repomd.xml.asc download (the GPG check) must not stall
+        # the other repositories' transfers in the same download session -
+        # the nested signature download must keep the outer download
+        # engine progressing (https://github.com/rpm-software-management/
+        # librepo/issues/415)
+        #
+        # Repo A serves its repomd.xml.asc with a 2 second delay. Repo B
+        # uses a TLS server that delays the handshake by 0.2 seconds and
+        # a 1 second connection timeout: if the download engine is not
+        # serviced while repo A's signature download runs, repo B's
+        # handshake cannot progress and the connection times out.
+        import http.server
+        import shutil
+        import ssl
+        import subprocess
+        import threading
+
+        if not shutil.which("openssl"):
+            self.skipTest("openssl is not available")
+
+        repomd = open(os.path.join(TEST_DATA, "repo_yum_01/repodata/repomd.xml"),
+                      "rb").read()
+        signature = open(os.path.join(TEST_DATA, "repo_yum_01/repodata/repomd.xml.asc"),
+                         "rb").read()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_GET(self):
+                # Repo A: the signature is served with a 2 second delay
+                if self.path.endswith("/repo_a/repodata/repomd.xml.asc"):
+                    time.sleep(2)
+                    data = signature
+                else:
+                    data = repomd if self.path.endswith(".xml") else signature
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        # A TLS server that delays the handshake (the handshake cannot
+        # progress unless the client's curl multi handle is serviced)
+        cert = os.path.join(self.tmpdir, "cert.pem")
+        key = os.path.join(self.tmpdir, "key.pem")
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", key, "-out", cert, "-days", "1", "-subj",
+             "/CN=localhost"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+
+        class TLSServer(http.server.ThreadingHTTPServer):
+            def get_request(self):
+                sock, addr = super().get_request()
+                time.sleep(0.2)
+                try:
+                    return ctx.wrap_socket(sock, server_side=True), addr
+                except Exception:
+                    sock.close()
+                    raise
+
+        servers = [http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler),
+                   TLSServer(("127.0.0.1", 0), Handler)]
+        for server in servers:
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            url_a = "http://127.0.0.1:%d" % servers[0].server_address[1]
+            url_b = "https://127.0.0.1:%d" % servers[1].server_address[1]
+
+            h_a = librepo.Handle()
+            h_a.urls = [url_a + "/repo_a"]
+            h_a.destdir = os.path.join(self.tmpdir, "a")
+            h_a.repotype = librepo.LR_YUMREPO
+            h_a.gpgcheck = True
+            h_a.yumdlist = []
+            h_a.connecttimeout = 10
+            # The session takes its config from the first target's handle
+            h_a.maxmirrortries = 1
+
+            h_b = librepo.Handle()
+            h_b.urls = [url_b + "/repo_b"]
+            h_b.destdir = os.path.join(self.tmpdir, "b")
+            h_b.repotype = librepo.LR_YUMREPO
+            h_b.gpgcheck = True
+            h_b.yumdlist = []
+            h_b.connecttimeout = 1
+            h_b.maxmirrortries = 1
+            h_b.sslverifypeer = False
+            h_b.sslverifyhost = False
+
+            targets = [librepo.MetadataTarget(h_a, None, None, None, None, None),
+                      librepo.MetadataTarget(h_b, None, None, None, None, None)]
+            librepo.download_metadata(targets)
+
+            for t in targets:
+                self.assertIsNone(t.err)
+        finally:
+            for server in servers:
+                server.shutdown()
+                server.server_close()
 
     def test_download_repo_01_with_missing_file(self):
         h = librepo.Handle()

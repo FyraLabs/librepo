@@ -49,10 +49,29 @@ struct _LrDownloadTarget;
  * content for the mirror it was downloaded from. On failure the engine
  * treats the mirror as failed and tries the next mirror.
  *
+ * The callback may be called multiple times for the same target (once
+ * per mirror attempt, with a different mirror_url). For zchunk targets
+ * it is called only when the file is fully downloaded, including the
+ * case when the complete file was found in the cache (in that case no
+ * transfer is performed for the attempt and mirror_url is the URL of
+ * the mirror the file would have been downloaded from). It runs in the
+ * thread executing the download while the engine is paused, so blocking
+ * work (including nested librepo downloads on the same handle) is
+ * allowed; nested downloads keep the outer download's other transfers
+ * making progress.
+ *
+ * A validation failure is retried on the next mirror, unless the error
+ * code is LRE_INTERRUPTED or LRE_CBINTERRUPTED - those are treated as
+ * fatal and abort the whole download (a user cancellation must not be
+ * turned into a mirror fallback).
+ *
  * @param target      Downloaded target
  * @param mirror_url  URL of the mirror the content was downloaded from
  *                    (NULL if the target used a base URL instead of a mirror)
- * @param err         Set to a GError on failure (optional)
+ * @param err         Set to a GError on failure (optional). The engine
+ *                    takes ownership of the error and frees it; the
+ *                    callback must not free it. If NULL, the engine
+ *                    reports a generic "Validation failed" error.
  * @return TRUE on success, FALSE if the content failed validation
  */
 typedef gboolean (*LrTargetValidateCb)(struct _LrDownloadTarget *target,
@@ -129,16 +148,6 @@ typedef struct _LrDownloadTarget {
     LrMirrorFailureCb mirrorfailurecb; /*!<
         Called when download from a mirror failed. */
 
-    LrTargetValidateCb validatecb; /*!<
-        Optional post-download validation callback. If set, it is called
-        after a successful transfer (after checksum verification). If it
-        fails, the mirror is treated as failed and the next mirror is
-        tried. */
-
-    void *validatecb_userdata; /*!<
-        User data passed to the validation callback. Not touched by
-        lr_downloadtarget_free. */
-
     GStringChunk *chunk; /*!<
         Chunk for strings used in this structure. */
 
@@ -192,6 +201,25 @@ typedef struct _LrDownloadTarget {
     double downloaded; /*!<
         Amount already downloaded in zchunk file */
     #endif /* @LIBREPO_ZCHUNK_ENABLED@ */
+
+    // New options - put at end to maintain API stability
+    LrTargetValidateCb validatecb; /*!<
+        Optional post-download validation callback. If set, it is called
+        after a successful transfer (after checksum verification). If it
+        fails, the mirror is treated as failed and the next mirror is
+        tried. */
+
+    void *validatecb_userdata; /*!<
+        User data passed to the validation callback. Not touched by
+        lr_downloadtarget_free. */
+
+    LrCbReturnCode cb_return_code; /*!<
+        Return code of the user callbacks (progress, mirror failure,
+        or end callback) for this target. Filled by the downloader.
+        The most severe code seen during the last transfer attempt
+        (a later callback returning LR_CB_OK does not clear an
+        earlier LR_CB_ERROR). LR_CB_OK if no callback was called or
+        none of them asked to abort. */
 
 } LrDownloadTarget;
 

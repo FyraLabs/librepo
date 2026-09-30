@@ -297,14 +297,13 @@ create_repomd_xml_download_targets(GSList *targets,
             // GPG verification of repomd.xml is done per mirror by the
             // download engine (see lr_yum_repomd_gpg_validate)
             if (handle->checks & LR_CHECK_GPG) {
+                LrYumValidateData *data = g_new0(LrYumValidateData, 1);
+                data->repo = target->repo;
+                // Borrowed from the target's string chunk - the target
+                // outlives the download
+                data->gnupghomedir = target->gnupghomedir;
                 download_target->validatecb = lr_yum_repomd_gpg_validate;
-                download_target->validatecb_userdata = target->repo;
-            }
-            // The GPG validation callback runs during the download, so the
-            // GPG home directory must be set on the handle by now
-            if (target->gnupghomedir) {
-                lr_free(handle->gnupghomedir);
-                handle->gnupghomedir = g_strdup(target->gnupghomedir);
+                download_target->validatecb_userdata = data;
             }
 
             target->download_target = download_target;
@@ -350,12 +349,13 @@ process_repomd_xml(GSList *targets,
             goto fail;
         }
 
-        handle->used_mirror =  g_strdup(target->download_target->usedmirror);
-
         if (target->download_target->rcode != LRE_OK) {
             lr_metadatatarget_append_error(target, "%s", lr_strerror(target->download_target->rcode));
             goto fail;
         }
+
+        lr_free(handle->used_mirror);
+        handle->used_mirror =  g_strdup(target->download_target->usedmirror);
 
         lseek(fd_value, 0, SEEK_SET);
         ret = lr_yum_repomd_parse_file(target->repomd, fd_value, lr_xml_parser_warning_logger,
@@ -395,6 +395,9 @@ lr_metadata_download_cleanup(GSList *download_targets)
             ret = FALSE;
         }
 
+        // Free the per-target GPG validation data (the callback has
+        // run by now)
+        g_free(download_target->validatecb_userdata);
         lr_downloadtarget_free(download_target);
     }
     g_slist_free(download_targets);
