@@ -430,72 +430,91 @@ lr_prepare_repomd_xml_file(LrHandle *handle,
     return fd;
 }
 
-/** Check repomd.xml.asc if available.
- * Try to download and verify GPG signature (repomd.xml.asc).
- * Try to download only from the mirror where repomd.xml itself was
- * downloaded. It is because most of yum repositories are not signed
- * and try every mirror for signature is non effective.
- * Every mirror would be tried because mirrored_download function have
- * no clue if 404 for repomd.xml.asc means that no signature exists or
- * it is just error on the mirror and should try the next one.
- **/
+/** Post-download validation callback for repomd.xml with GPG check
+ * enabled.
+ *
+ * Verifies the GPG signature (repomd.xml.asc) of the downloaded
+ * repomd.xml. The signature is downloaded from the same mirror that
+ * provided repomd.xml, so the pair is always consistent. If the
+ * signature is missing or invalid, the callback fails and the download
+ * engine treats the mirror as failed and tries the next mirror
+ * (https://github.com/rpm-software-management/librepo/issues/415).
+ *
+ * On success, repo->signature (validatecb_userdata) is set to the local
+ * path of the downloaded repomd.xml.asc.
+ */
 gboolean
-lr_check_repomd_xml_asc_availability(LrHandle *handle,
-                                     LrYumRepo *repo,
-                                     int fd,
-                                     char *path,
-                                     GError **err)
+lr_yum_repomd_gpg_validate(LrDownloadTarget *target,
+                           const char *mirror_url,
+                           GError **err)
 {
+    LrHandle *handle = target->handle;
+    LrYumRepo *repo = target->validatecb_userdata;
     GError *tmp_err = NULL;
     gboolean ret;
 
-    if (handle->checks & LR_CHECK_GPG) {
-        int fd_sig;
-        char *url, *signature;
+    assert(!err || *err == NULL);
+    assert(handle);
+    assert(repo);
 
-        signature = lr_pathconcat(handle->destdir, "repodata/repomd.xml.asc", NULL);
-        fd_sig = open(signature, O_CREAT | O_TRUNC | O_RDWR, 0666);
-        if (fd_sig == -1) {
-            g_debug("%s: Cannot open: %s", __func__, signature);
-            g_set_error(err, LR_YUM_ERROR, LRE_IO,
-                        "Cannot open %s: %s", signature, g_strerror(errno));
-            g_free(signature);
-            return FALSE;
-        }
-
-        url = lr_pathconcat(handle->used_mirror, "repodata/repomd.xml.asc", NULL);
-        ret = lr_download_url(handle, url, fd_sig, &tmp_err);
-        g_free(url);
-        close(fd_sig);
-        if (!ret) {
-            // Error downloading signature
-            g_set_error(err, LR_YUM_ERROR, LRE_BADGPG,
-                        "GPG verification is enabled, but GPG signature "
-                        "is not available. This may be an error or the "
-                        "repository does not support GPG verification: %s", tmp_err->message);
-            g_clear_error(&tmp_err);
-            unlink(signature);
-            g_free(signature);
-            return FALSE;
-        } else {
-            // Signature downloaded
-            repo->signature = g_strdup(signature);
-            ret = lr_gpg_check_signature(signature,
-                                         path,
-                                         handle->gnupghomedir,
-                                         &tmp_err);
-            g_free(signature);
-            if (!ret) {
-                g_debug("%s: GPG signature verification failed: %s",
-                        __func__, tmp_err->message);
-                g_propagate_prefixed_error(err, tmp_err,
-                                           "repomd.xml GPG signature verification error: ");
-                return FALSE;
-            }
-            g_debug("%s: GPG signature successfully verified", __func__);
-        }
+    if (!mirror_url) {
+        // The target used a base URL instead of a mirror, there is no
+        // mirror to download the signature from
+        g_set_error(err, LR_YUM_ERROR, LRE_BADGPG,
+                    "GPG verification is enabled, but the mirror is "
+                    "not known, cannot verify repomd.xml");
+        return FALSE;
     }
 
+    // Download repomd.xml.asc from the same mirror that provided repomd.xml
+    char *signature = lr_pathconcat(handle->destdir, "repodata/repomd.xml.asc", NULL);
+    int fd_sig = open(signature, O_CREAT | O_TRUNC | O_RDWR, 0666);
+    if (fd_sig == -1) {
+        g_debug("%s: Cannot open: %s", __func__, signature);
+        g_set_error(err, LR_YUM_ERROR, LRE_IO,
+                    "Cannot open %s: %s", signature, g_strerror(errno));
+        g_free(signature);
+        return FALSE;
+    }
+    char *url = lr_pathconcat(mirror_url, "repodata/repomd.xml.asc", NULL);
+    ret = lr_yum_download_url(handle, url, fd_sig, TRUE, FALSE, &tmp_err);
+    g_free(url);
+    close(fd_sig);
+    if (!ret) {
+        // Error downloading signature
+        g_debug("%s: Cannot download repomd.xml.asc from %s: %s",
+                __func__, mirror_url, tmp_err->message);
+        g_set_error(err, LR_YUM_ERROR, LRE_BADGPG,
+                    "GPG verification is enabled, but GPG signature "
+                    "is not available. This may be an error or the "
+                    "repository does not support GPG verification: %s",
+                    tmp_err->message);
+        g_clear_error(&tmp_err);
+        unlink(signature);
+        g_free(signature);
+        return FALSE;
+    }
+
+    // Verify the GPG signature
+    char *repomd_path = lr_pathconcat(handle->destdir, target->path, NULL);
+    ret = lr_gpg_check_signature(signature, repomd_path,
+                                 handle->gnupghomedir, &tmp_err);
+    g_free(repomd_path);
+    if (!ret) {
+        g_debug("%s: GPG signature verification failed from %s: %s",
+                __func__, mirror_url, tmp_err->message);
+        g_propagate_prefixed_error(err, tmp_err,
+                                   "repomd.xml GPG signature verification error: ");
+        unlink(signature);
+        g_free(signature);
+        return FALSE;
+    }
+
+    // Success - record the local path of the verified signature
+    g_debug("%s: GPG signature successfully verified from %s",
+            __func__, mirror_url);
+    repo->signature = g_strdup(signature);
+    g_free(signature);
     return TRUE;
 }
 
@@ -593,6 +612,7 @@ lr_yum_download_url(LrHandle *lr_handle, const char *url, int fd,
 
 static gboolean
 lr_yum_download_repomd(LrHandle *handle,
+                       LrYumRepo *repo,
                        LrMetalink *metalink,
                        int fd,
                        GError **err)
@@ -633,6 +653,14 @@ lr_yum_download_repomd(LrHandle *handle,
                                                      NULL,
                                                      TRUE,
                                                      FALSE);
+
+    // GPG verification of repomd.xml is done per mirror by the download
+    // engine - a mirror with a missing or invalid repomd.xml.asc is
+    // skipped and the next mirror is tried
+    if (handle->checks & LR_CHECK_GPG) {
+        target->validatecb = lr_yum_repomd_gpg_validate;
+        target->validatecb_userdata = repo;
+    }
 
     ret = lr_download_target(target, &tmp_err);
     assert((ret && !tmp_err) || (!ret && tmp_err));
@@ -1400,15 +1428,10 @@ lr_yum_download_remote(LrHandle *handle, LrResult *result, GError **err)
         if ((fd = lr_prepare_repomd_xml_file(handle, &path, err)) == -1)
             return FALSE;
 
-        /* Download repomd.xml */
-        ret = lr_yum_download_repomd(handle, handle->metalink, fd, err);
+        /* Download repomd.xml (and verify its GPG signature per mirror
+         * when enabled) */
+        ret = lr_yum_download_repomd(handle, repo, handle->metalink, fd, err);
         if (!ret) {
-            close(fd);
-            lr_free(path);
-            return FALSE;
-        }
-
-        if (!lr_check_repomd_xml_asc_availability(handle, repo, fd, path, err)) {
             close(fd);
             lr_free(path);
             return FALSE;

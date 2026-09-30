@@ -32,6 +32,7 @@
 
 #include "handle_internal.h"
 #include "librepo.h"
+#include "yum_internal.h"
 
 LrMetadataTarget *
 lr_metadatatarget_new(LrHandle *handle,
@@ -293,6 +294,19 @@ create_repomd_xml_download_targets(GSList *targets,
                                                     TRUE,
                                                     FALSE);
 
+            // GPG verification of repomd.xml is done per mirror by the
+            // download engine (see lr_yum_repomd_gpg_validate)
+            if (handle->checks & LR_CHECK_GPG) {
+                download_target->validatecb = lr_yum_repomd_gpg_validate;
+                download_target->validatecb_userdata = target->repo;
+            }
+            // The GPG validation callback runs during the download, so the
+            // GPG home directory must be set on the handle by now
+            if (target->gnupghomedir) {
+                lr_free(handle->gnupghomedir);
+                handle->gnupghomedir = g_strdup(target->gnupghomedir);
+            }
+
             target->download_target = download_target;
             (*download_targets) = g_slist_append((*download_targets), download_target);
             (*fd_list) = appendFdValue((*fd_list), fd);
@@ -337,16 +351,9 @@ process_repomd_xml(GSList *targets,
         }
 
         handle->used_mirror =  g_strdup(target->download_target->usedmirror);
-        handle->gnupghomedir = g_strdup(target->gnupghomedir);
 
         if (target->download_target->rcode != LRE_OK) {
             lr_metadatatarget_append_error(target, "%s", lr_strerror(target->download_target->rcode));
-            goto fail;
-        }
-
-        if (!lr_check_repomd_xml_asc_availability(handle, target->repo, fd_value, path->data, &error)) {
-            lr_metadatatarget_append_error(target, "%s", error->message);
-            g_clear_error(&error);
             goto fail;
         }
 

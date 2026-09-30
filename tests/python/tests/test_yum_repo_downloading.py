@@ -753,7 +753,47 @@ class TestCaseYumRepoDownloading(TestCaseWithServer):
 
         self.assertTrue(yum_repo)
         self.assertTrue(yum_repomd)
-        self.assertTrue("signature" not in yum_repo or yum_repo["signature"])
+        # After a failed GPG check no valid signature is recorded
+        self.assertTrue(yum_repo["signature"] is None
+                      or not os.path.exists(yum_repo["signature"]))
+
+    def test_download_repo_with_gpg_check_bad_signature_mirror_retry(self):
+        # https://github.com/rpm-software-management/librepo/issues/415
+        # A mirror with an invalid repomd.xml.asc must not cause the
+        # download to fail if the next mirror has a valid signature
+        h = librepo.Handle()
+        r = librepo.Result()
+
+        url_bad = "%s%s%s" % (self.MOCKURL, config.BADGPG, config.REPO_YUM_01_PATH)
+        url_good = "%s%s" % (self.MOCKURL, config.REPO_YUM_01_PATH)
+        h.urls = [url_bad, url_good]
+        h.repotype = librepo.LR_YUMREPO
+        h.destdir = self.tmpdir
+        h.gpgcheck = True
+        h.perform(r)
+
+        yum_repo   = r.getinfo(librepo.LRR_YUM_REPO)
+        yum_repomd = r.getinfo(librepo.LRR_YUM_REPOMD)
+
+        self.assertTrue(yum_repo)
+        self.assertTrue(yum_repomd)
+
+    def test_download_metadata_with_gpg_check_bad_signature_mirror_retry(self):
+        # Same as test_download_repo_with_gpg_check_bad_signature_mirror_retry,
+        # but through the LrMetadataTarget API
+        h = librepo.Handle()
+
+        url_bad = "%s%s%s" % (self.MOCKURL, config.BADGPG, config.REPO_YUM_01_PATH)
+        url_good = "%s%s" % (self.MOCKURL, config.REPO_YUM_01_PATH)
+        h.urls = [url_bad, url_good]
+        h.repotype = librepo.LR_YUMREPO
+        h.destdir = self.tmpdir
+        h.gpgcheck = True
+
+        target = librepo.MetadataTarget(h, None, None, None, None, None)
+        librepo.download_metadata([target])
+
+        self.assertIsNone(target.err)
 
     def test_download_repo_01_with_missing_file(self):
         h = librepo.Handle()

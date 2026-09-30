@@ -40,6 +40,25 @@ typedef struct {
     gchar *value;
 } LrDownloadTargetChecksum;
 
+struct _LrDownloadTarget;
+
+/** Post-download validation callback.
+ *
+ * Called by the download engine after a transfer finished successfully
+ * (after checksum verification) to let the caller validate the downloaded
+ * content for the mirror it was downloaded from. On failure the engine
+ * treats the mirror as failed and tries the next mirror.
+ *
+ * @param target      Downloaded target
+ * @param mirror_url  URL of the mirror the content was downloaded from
+ *                    (NULL if the target used a base URL instead of a mirror)
+ * @param err         Set to a GError on failure (optional)
+ * @return TRUE on success, FALSE if the content failed validation
+ */
+typedef gboolean (*LrTargetValidateCb)(struct _LrDownloadTarget *target,
+                                      const char *mirror_url,
+                                      GError **err);
+
 /** Create new LrDownloadTargetChecksum object.
  * @param type      Checksum type
  * @param value     Checksum value. This value will be stduped.
@@ -55,7 +74,7 @@ lr_downloadtargetchecksum_free(LrDownloadTargetChecksum *dtch);
 
 /** Single download target
  */
-typedef struct {
+typedef struct _LrDownloadTarget {
 
     LrHandle *handle; /*!<
         Handle */
@@ -109,6 +128,16 @@ typedef struct {
 
     LrMirrorFailureCb mirrorfailurecb; /*!<
         Called when download from a mirror failed. */
+
+    LrTargetValidateCb validatecb; /*!<
+        Optional post-download validation callback. If set, it is called
+        after a successful transfer (after checksum verification). If it
+        fails, the mirror is treated as failed and the next mirror is
+        tried. */
+
+    void *validatecb_userdata; /*!<
+        User data passed to the validation callback. Not touched by
+        lr_downloadtarget_free. */
 
     GStringChunk *chunk; /*!<
         Chunk for strings used in this structure. */

@@ -187,6 +187,10 @@ typedef struct {
     GSList *tried_mirrors; /*!<
         List of already tried mirrors (LrMirror *).
         This mirrors won't be tried again. */
+    GError *last_validate_err; /*!<
+        Last post-download validation error (from the validatecb), or
+        NULL. Used to report the most relevant error when all mirrors
+        were tried without success. */
     gboolean resume; /*!<
         Is resume enabled? Download target may state that resume is True
         but Librepo can decide that resuming won't be done.
@@ -875,9 +879,18 @@ select_suitable_mirror(LrDownload *dd,
         g_debug("%s: All mirrors were tried without success", __func__);
         target->state = LR_DS_FAILED;
 
-        lr_downloadtarget_set_error(target->target, LRE_NOURL,
+        if (target->last_validate_err) {
+            // Mirrors were found, but none provided valid content -
+            // report the validation error, it is more relevant than
+            // LRE_NOURL
+            lr_downloadtarget_set_error(target->target,
+                    target->last_validate_err->code,
+                    "%s", target->last_validate_err->message);
+        } else {
+            lr_downloadtarget_set_error(target->target, LRE_NOURL,
                     "Cannot download, all mirrors were already tried "
                     "without success");
+        }
 
 
         // Call end callback
@@ -899,9 +912,15 @@ select_suitable_mirror(LrDownload *dd,
 
         if (dd->failfast) {
             // Fail immediately
-            g_set_error(err, LR_DOWNLOADER_ERROR, LRE_NOURL,
-                        "Cannot download %s: All mirrors were tried",
-                        target->target->path);
+            if (target->last_validate_err) {
+                // Report the most relevant error (content validation
+                // failure, not "no mirrors")
+                g_propagate_error(err, g_error_copy(target->last_validate_err));
+            } else {
+                g_set_error(err, LR_DOWNLOADER_ERROR, LRE_NOURL,
+                            "Cannot download %s: All mirrors were tried",
+                            target->target->path);
+            }
             return FALSE;
         }
     }
@@ -2515,6 +2534,31 @@ check_transfer_statuses(LrDownload *dd, GError **err)
         //
         // Any other checks should go here
         //
+        #ifdef WITH_ZCHUNK
+        // Validate zchunk files only when they are fully downloaded
+        if (target->target->validatecb &&
+            (!target->target->is_zchunk || target->zck_state == LR_ZCK_DL_FINISHED)) {
+        #else
+        if (target->target->validatecb) {
+        #endif
+            GError *validate_err = NULL;
+            const char *mirror_url = target->mirror ? target->mirror->mirror->url : NULL;
+            gboolean ret = target->target->validatecb(target->target, mirror_url, &validate_err);
+            if (!ret) {
+                g_debug("%s: Validation failed: %s", effective_url,
+                        validate_err ? validate_err->message : "(no error message)");
+                if (!validate_err)
+                    g_set_error(&validate_err, LR_DOWNLOADER_ERROR, LRE_BADGPG,
+                               "Validation failed");
+                // Keep a copy - the error below is freed on retry, but the
+                // copy is used to report the most relevant error when all
+                // mirrors are exhausted
+                g_clear_error(&target->last_validate_err);
+                target->last_validate_err = g_error_copy(validate_err);
+                transfer_err = validate_err;
+                goto transfer_error;
+            }
+        }
 
 transfer_error:
 
@@ -3011,6 +3055,7 @@ lr_download_cleanup:
         }
 
         g_slist_free(target->tried_mirrors);
+        g_clear_error(&target->last_validate_err);
         lr_free(target);
     }
     g_slist_free(dd.targets);

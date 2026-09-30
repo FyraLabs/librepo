@@ -132,9 +132,6 @@ lr_copy_metalink_content(LrHandle *handle, LrYumRepo *repo, GError **err);
 int
 lr_prepare_repomd_xml_file(LrHandle *handle, char **path, GError **err);
 
-gboolean
-lr_check_repomd_xml_asc_availability(LrHandle *handle, LrYumRepo *repo, int fd, char *path, GError **err);
-
 /** Stores best checksum on the beginning of @param checksums
  * @param metalink      Metalink
  * @param checksums     List of checksums

@@ -26,6 +26,7 @@
 #include "rcodes.h"
 #include "result.h"
 #include "handle.h"
+#include "yum.h"
 
 G_BEGIN_DECLS
 
@@ -34,6 +35,10 @@ lr_yum_perform(LrHandle *handle, LrResult *result, GError **err);
 gboolean
 lr_yum_download_url(LrHandle *lr_handle, const char *url, int fd,
                     gboolean no_cache, gboolean is_zchunk, GError **err);
+gboolean
+lr_yum_repomd_gpg_validate(LrDownloadTarget *target,
+                           const char *mirror_url,
+                           GError **err);
 
 G_END_DECLS
 
