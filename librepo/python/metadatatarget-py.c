@@ -380,7 +380,7 @@ get_pythonobj(_MetadataTargetObject *self, void *member_offset)
             PyTuple_SetItem(pylist, i, str);
         }
 
-        Py_XINCREF(target->err);
+        Py_XINCREF(pylist);
         return pylist;
     }
 
