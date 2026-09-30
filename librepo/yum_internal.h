@@ -27,28 +27,17 @@
 #include "result.h"
 #include "handle.h"
 #include "downloadtarget.h"
-#include "yum.h"
 
 G_BEGIN_DECLS
-
-// Per-target data for the repomd.xml GPG validation callback
-// (LrTargetValidateCb). gnupghomedir is a borrowed pointer (owned by
-// the LrMetadataTarget's string chunk, or NULL to use the handle's).
-typedef struct {
-    LrYumRepo *repo;
-    const char *gnupghomedir;
-} LrYumValidateData;
 
 gboolean
 lr_yum_perform(LrHandle *handle, LrResult *result, GError **err);
 gboolean
 lr_yum_download_url(LrHandle *lr_handle, const char *url, int fd,
-                    gboolean no_cache, gboolean is_zchunk,
-                    GError **err, LrCbReturnCode *cb_return_code);
-gboolean
-lr_yum_repomd_gpg_validate(LrDownloadTarget *target,
-                           const char *mirror_url,
-                           GError **err);
+                    gboolean no_cache, gboolean is_zchunk, GError **err);
+
+void
+lr_yum_repomd_setup_gpg(LrDownloadTarget *target, const char *gnupghomedir);
 
 G_END_DECLS
 

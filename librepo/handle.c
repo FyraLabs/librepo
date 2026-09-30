@@ -993,7 +993,7 @@ lr_yum_download_url_retry(int attempts, LrHandle *lr_handle, const char *url,
     gboolean ret = FALSE;
 
     for (int i = 1;; i++) {
-        ret = lr_yum_download_url(lr_handle, url, fd, no_cache, is_zchunk, err, NULL);
+        ret = lr_yum_download_url(lr_handle, url, fd, no_cache, is_zchunk, err);
         if (ret)
             return ret;
 

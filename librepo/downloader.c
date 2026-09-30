@@ -51,6 +51,7 @@
 #include "cleanup.h"
 #include "url_substitution.h"
 #include "yum_internal.h"
+#include "gpg.h"
 #include "xattr_internal.h"
 
 
@@ -60,36 +61,6 @@ void
 lr_sigint_handler(G_GNUC_UNUSED int sig)
 {
     lr_interrupt = 1;
-}
-
-// A validation callback may start a nested download (e.g. the GPG
-// signature download for repomd.xml). While the nested download runs,
-// the outer session's multi handle is not serviced by its own loop,
-// so the nested session services it instead: the outer sessions' running
-// transfers keep making progress and their curl timeouts stay satisfied.
-// The stack of the outer sessions' multi handles is kept thread-local:
-// a nested download always runs in the thread of its parent.
-#define LR_NESTED_DOWNLOADS_MAX 8
-#if defined(__GNUC__) || defined(__clang__)
-#define LR_THREAD __thread
-#else
-#define LR_THREAD
-#endif
-static LR_THREAD CURLM *nested_parent_multis[LR_NESTED_DOWNLOADS_MAX];
-static LR_THREAD int nested_parent_multis_count = 0;
-
-static void
-lr_download_push_parent(CURLM *multi)
-{
-    if (nested_parent_multis_count < LR_NESTED_DOWNLOADS_MAX)
-        nested_parent_multis[nested_parent_multis_count++] = multi;
-}
-
-static void
-lr_download_pop_parent(void)
-{
-    if (nested_parent_multis_count > 0)
-        nested_parent_multis_count--;
 }
 
 typedef enum {
@@ -200,6 +171,10 @@ typedef struct {
         State of the download (transfer). */
     LrDownloadTarget *target; /*!<
         Download target */
+    LrDownloadTarget *signed_target; /*!<
+        Original target while target downloads its signature, otherwise NULL. */
+    char *data_effective_url; /*!< URL of the data, not its signature. */
+    GError *last_gpg_error; /*!< Preserve verification errors on mirror exhaustion. */
     LrMirror *mirror; /*!<
         Mirror is:
         If a base_location is used then NULL.
@@ -217,15 +192,6 @@ typedef struct {
     GSList *tried_mirrors; /*!<
         List of already tried mirrors (LrMirror *).
         This mirrors won't be tried again. */
-    GError *last_validate_err; /*!<
-        Last post-download validation error (from the validatecb), or
-        NULL. Used to report the most relevant error when all mirrors
-        were tried without success. */
-    gboolean validate_ok; /*!<
-        Post-download validation (validatecb) succeeded for this target.
-        TRUE from the start when the target has no validatecb. A
-        zchunk file that is already complete (e.g. found in the cache)
-        is trusted only when this is TRUE. */
     gboolean resume; /*!<
         Is resume enabled? Download target may state that resume is True
         but Librepo can decide that resuming won't be done.
@@ -295,15 +261,6 @@ typedef struct {
 
     GSList *running_transfers; /*!<
         List of running transfers (list of pointer to LrTarget structures) */
-
-    // Cooperative servicing of parent (outer) download sessions
-    CURLM *cooperative_multi[LR_NESTED_DOWNLOADS_MAX]; /*!<
-        Multi handles of the outer download sessions this download is
-        nested in (a validation callback started it). Serviced while
-        this download runs so the outer sessions' transfers keep making
-        progress. */
-    int cooperative_multi_count; /*!<
-        Number of entries in cooperative_multi. */
 
 } LrDownload;
 
@@ -555,12 +512,9 @@ lr_progresscb(void *ptr,
                                      total_to_download,
                                      now_downloaded);
 
-    // A later invocation (e.g. curl's final call after the transfer
-    // was aborted by an earlier LR_CB_ERROR) must not clear an
-    // earlier abort request
+    // curl may call progress once more after an abort. Do not lose it.
     if (ret > target->cb_return_code)
         target->cb_return_code = ret;
-    target->target->cb_return_code = target->cb_return_code;
 
     return ret;
 }
@@ -928,18 +882,10 @@ select_suitable_mirror(LrDownload *dd,
         g_debug("%s: All mirrors were tried without success", __func__);
         target->state = LR_DS_FAILED;
 
-        if (target->last_validate_err) {
-            // Mirrors were found, but none provided valid content -
-            // report the validation error, it is more relevant than
-            // LRE_NOURL
-            lr_downloadtarget_set_error(target->target,
-                    target->last_validate_err->code,
-                    "%s", target->last_validate_err->message);
-        } else {
-            lr_downloadtarget_set_error(target->target, LRE_NOURL,
-                    "Cannot download, all mirrors were already tried "
-                    "without success");
-        }
+        lr_downloadtarget_set_error(target->target,
+                    target->last_gpg_error ? target->last_gpg_error->code : LRE_NOURL,
+                    "%s", target->last_gpg_error ? target->last_gpg_error->message :
+                    "Cannot download, all mirrors were already tried without success");
 
 
         // Call end callback
@@ -951,7 +897,6 @@ select_suitable_mirror(LrDownload *dd,
                              "were already tried without success");
             if (ret == LR_CB_ERROR) {
                 target->cb_return_code = LR_CB_ERROR;
-                target->target->cb_return_code = LR_CB_ERROR;
                 g_debug("%s: Downloading was aborted by LR_CB_ERROR "
                         "from end callback", __func__);
                 g_set_error(err, LR_DOWNLOADER_ERROR, LRE_CBINTERRUPTED,
@@ -962,15 +907,12 @@ select_suitable_mirror(LrDownload *dd,
 
         if (dd->failfast) {
             // Fail immediately
-            if (target->last_validate_err) {
-                // Report the most relevant error (content validation
-                // failure, not "no mirrors")
-                g_propagate_error(err, g_error_copy(target->last_validate_err));
-            } else {
+            if (target->last_gpg_error)
+                g_propagate_error(err, g_error_copy(target->last_gpg_error));
+            else
                 g_set_error(err, LR_DOWNLOADER_ERROR, LRE_NOURL,
                             "Cannot download %s: All mirrors were tried",
                             target->target->path);
-            }
             return FALSE;
         }
     }
@@ -1050,7 +992,13 @@ select_next_target(LrDownload *dd,
 
         // Prepare full target URL
 
-        if (complete_url_in_path) {
+        if (target->signed_target && target->mirror) {
+            // A signature belongs to the current mirror attempt, not a new one.
+            mirror = target->mirror;
+            if (is_parallel_connections_limited_and_reached(mirror))
+                continue;
+            full_url = lr_pathconcat(mirror->mirror->url, target->target->path, NULL);
+        } else if (complete_url_in_path) {
             // Path is a complete URL (do not use mirror nor base URL)
             full_url = g_strdup(target->target->path);
         } else if (target->target->baseurl) {
@@ -1103,7 +1051,6 @@ select_next_target(LrDownload *dd,
                                 "and no local URL is available");
                 if (ret == LR_CB_ERROR) {
                     target->cb_return_code = LR_CB_ERROR;
-                    target->target->cb_return_code = LR_CB_ERROR;
                     g_debug("%s: Downloading was aborted by LR_CB_ERROR "
                             "from end callback", __func__);
                     g_set_error(err, LR_DOWNLOADER_ERROR, LRE_CBINTERRUPTED,
@@ -1603,6 +1550,22 @@ transfer_end(LrTarget *target)
     lr_free(transfer);
 }
 
+/* Release the signature target and restore the data target before reporting
+ * results, retrying another mirror, or cleaning up an interrupted download. */
+static void
+finish_signature(LrTarget *target, gboolean verified)
+{
+    if (!target->signed_target)
+        return;
+    if (verified)
+        remove_librepo_xattr(target->target);
+    lr_downloadtarget_free(target->target);
+    target->target = target->signed_target;
+    target->signed_target = NULL;
+    if (!verified)
+        unlink(target->target->gpg_signature);
+}
+
 /** Open the file to write to
  */
 static FILE*
@@ -1646,19 +1609,6 @@ open_target_file(LrTarget *target, GError **err)
 
     return f;
 }
-
-static gboolean
-sort_mirrors(GSList *mirrors, LrMirror *mirror, gboolean success, gboolean serious);
-
-static gboolean
-handle_failed_transfer(LrDownload *dd,
-                      LrTarget *target,
-                      GError *transfer_err,
-                      gboolean serious_error,
-                      gboolean *fatal_error,
-                      const char *effective_url,
-                      GError **fail_fast_error,
-                      GError **err);
 
 /** Prepare next transfer
  */
@@ -1761,103 +1711,26 @@ prepare_next_transfer(LrDownload *dd, gboolean *candidatefound, GError **err)
             goto fail;
         }
 
-        // If zchunk is finished, we're done, so move to next target.
-        // A file whose post-download validation previously failed is
-        // not trusted - re-run the transfer (and the validation).
+        // If zchunk is finished, we're done, so move to next target
         if(target->zck_state == LR_ZCK_DL_FINISHED) {
-            // The file is complete (downloaded, or found in the cache).
-            // If it has a post-download validator, the validator must
-            // have succeeded for this mirror before we can report
-            // success - a cached file that was never validated is not
-            // trusted.
-            if (target->target->validatecb && !target->validate_ok) {
-                GError *validate_err = NULL;
-                const char *mirror_url = target->mirror ? target->mirror->mirror->url : NULL;
-                // The callback may start a nested download (e.g. the GPG
-                // signature download). Let the nested session service
-                // this session's multi handle so the other running
-                // transfers keep making progress and their curl timeouts
-                // stay satisfied.
-                lr_download_push_parent(dd->multi_handle);
-                gboolean validate_ok = target->target->validatecb(target->target, mirror_url, &validate_err);
-                lr_download_pop_parent();
-                if (validate_ok) {
-                    // A successful callback must not set an error - drop
-                    // it defensively
-                    g_clear_error(&validate_err);
-                    target->validate_ok = TRUE;
-                } else {
-                    g_debug("%s: Validation failed: %s", mirror_url ? mirror_url : "(baseurl)",
-                            validate_err ? validate_err->message : "(no error message)");
-                    if (!validate_err)
-                        g_set_error(&validate_err, LR_DOWNLOADER_ERROR, LRE_BADGPG,
-                                   "Validation failed");
-                    // Keep a copy - the error below is freed on retry, but the
-                    // copy is used to report the most relevant error when all
-                    // mirrors are exhausted
-                    g_clear_error(&target->last_validate_err);
-                    target->last_validate_err = g_error_copy(validate_err);
-                    // Cancellation during validation (a user callback asked
-                    // to stop, or the download was interrupted) is fatal:
-                    // retrying on another mirror would violate the user's
-                    // request
-                    gboolean fatal_error = FALSE;
-                    if (validate_err->code == LRE_INTERRUPTED ||
-                        validate_err->code == LRE_CBINTERRUPTED) {
-                        fatal_error = TRUE;
-                        if (validate_err->code == LRE_CBINTERRUPTED) {
-                            target->cb_return_code = LR_CB_ERROR;
-                            target->target->cb_return_code = LR_CB_ERROR;
-                        }
-                    }
-                    // The transfer was never added to the multi handle -
-                    // just release its state
-                    transfer_end(target);
-                    target->tried_mirrors = g_slist_append(target->tried_mirrors,
-                                                           target->mirror);
-                    if (target->mirror) {
-                        mirror_update_statistics(target->mirror, FALSE);
-                        if (dd->adaptivemirrorsorting)
-                            sort_mirrors(target->lrmirrors, target->mirror, FALSE, FALSE);
-                    }
-                    GError *fail_fast_error = NULL;
-                    if (!handle_failed_transfer(dd, target, validate_err,
-                                               FALSE, &fatal_error,
-                                               NULL,
-                                               &fail_fast_error, err))
-                        goto fail;
-                    if (fail_fast_error) {
-                        g_propagate_error(err, fail_fast_error);
-                        goto fail;
-                    }
-                    // The target is either waiting for a retry or failed
-                    // without aborting the session - move on
-                    return prepare_next_transfer(dd, candidatefound, err);
+            g_debug("%s: Target already fully downloaded: %s", __func__, target->target->path);
+            target->state = LR_DS_FINISHED;
+            LrEndCb end_cb =  target->target->endcb;
+            if (end_cb) {
+                int rc = end_cb(target->target->cbdata,
+                                LR_TRANSFER_SUCCESSFUL,
+                                "Already downloaded");
+                if (rc == LR_CB_ERROR) {
+                    g_set_error(err, LR_DOWNLOADER_ERROR, LRE_CBINTERRUPTED,
+                                "Interrupted by LR_CB_ERROR from end callback");
+                    goto fail;
                 }
             }
-            if (target->validate_ok && !target->last_validate_err) {
-                g_debug("%s: Target already fully downloaded: %s", __func__, target->target->path);
-                target->state = LR_DS_FINISHED;
-                LrEndCb end_cb =  target->target->endcb;
-                if (end_cb) {
-                    int rc = end_cb(target->target->cbdata,
-                                    LR_TRANSFER_SUCCESSFUL,
-                                    "Already downloaded");
-                    if (rc == LR_CB_ERROR) {
-                        g_set_error(err, LR_DOWNLOADER_ERROR, LRE_CBINTERRUPTED,
-                                    "Interrupted by LR_CB_ERROR from end callback");
-                        goto fail;
-                    }
-                }
-                // Released before recursing, so that a run of already-complete
-                // zchunk targets does not hold one transfer per level
-                transfer_end(target);
-                lr_downloadtarget_set_error(target->target, LRE_OK, NULL);
-                return prepare_next_transfer(dd, candidatefound, err);
-            }
-            // The file is complete but not trusted (a previous validation
-            // or checksum check failed) - fall through and re-run the
-            // transfer (and the validation).
+            // Released before recursing, so that a run of already-complete
+            // zchunk targets does not hold one transfer per level
+            transfer_end(target);
+            lr_downloadtarget_set_error(target->target, LRE_OK, NULL);
+            return prepare_next_transfer(dd, candidatefound, err);
         }
     }
     # endif /* WITH_ZCHUNK */
@@ -1951,7 +1824,6 @@ prepare_next_transfer(LrDownload *dd, gboolean *candidatefound, GError **err)
 
     // Prepare progress callback
     target->cb_return_code = LR_CB_OK;
-    target->target->cb_return_code = LR_CB_OK;
     if (target->target->progresscb) {
         c_rc = curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, lr_progresscb) ||
                curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0) ||
@@ -2208,6 +2080,13 @@ check_finished_transfer_status(CURLMsg *msg,
                         curl_easy_strerror(msg->data.result),
                         effective_url,
                         target->transfer->errorbuffer);
+
+            if (target->signed_target && msg->data.result == CURLE_ABORTED_BY_CALLBACK &&
+                target->cb_return_code == LR_CB_ERROR) {
+                g_clear_error(transfer_err);
+                g_set_error(transfer_err, LR_DOWNLOADER_ERROR, LRE_CBINTERRUPTED,
+                            "Interrupted by progress callback: %s", effective_url);
+            }
 
             switch (msg->data.result) {
             case CURLE_ABORTED_BY_CALLBACK:
@@ -2533,159 +2412,6 @@ exit:
 
 
 static gboolean
-handle_failed_transfer(LrDownload *dd,
-                      LrTarget *target,
-                      GError *transfer_err,
-                      gboolean serious_error,
-                      gboolean *fatal_error,
-                      const char *effective_url,
-                      GError **fail_fast_error,
-                      GError **err)
-{
-    assert(dd);
-    assert(target);
-    assert(transfer_err);
-    assert(!err || *err == NULL);
-
-    int complete_url_in_path = strstr(target->target->path, "://") ? 1 : 0;
-    guint num_of_tried_mirrors = g_slist_length(target->tried_mirrors);
-    gboolean retry = FALSE;
-
-    g_info("Error during transfer: %s", transfer_err->message);
-
-    // Call mirrorfailure callback
-    LrMirrorFailureCb mf_cb =  target->target->mirrorfailurecb;
-    if (mf_cb) {
-        int rc = mf_cb(target->target->cbdata,
-                       transfer_err->message,
-                       effective_url);
-        if (rc == LR_CB_ABORT) {
-            // User wants to abort this download, so make the error fatal
-            *fatal_error = TRUE;
-        } else if (rc == LR_CB_ERROR) {
-            gchar *original_err_msg = g_strdup(transfer_err->message);
-            g_clear_error(&transfer_err);
-            g_info("Downloading was aborted by LR_CB_ERROR from "
-                   "mirror failure callback. Original error was: %s", original_err_msg);
-            g_set_error(&transfer_err, LR_DOWNLOADER_ERROR, LRE_CBINTERRUPTED,
-                        "Downloading was aborted by LR_CB_ERROR from "
-                        "mirror failure callback. Original error was: "
-                        "%s", original_err_msg);
-            g_free(original_err_msg);
-            *fatal_error = TRUE;
-            target->cb_return_code = LR_CB_ERROR;
-            target->target->cb_return_code = LR_CB_ERROR;
-        }
-    }
-
-    if (!*fatal_error)
-    {
-        // Temporary error (serious_error) during download occurred and
-        // another transfers are running or there are successful transfers
-        // and fewer failed transfers than tried parallel connections. It may be mirror is OK
-        // but accepts fewer parallel connections.
-        if (serious_error && target->mirror &&
-            (has_running_transfers(target->mirror) ||
-              (target->mirror->successful_transfers > 0 &&
-                target->mirror->failed_transfers < target->mirror->max_tried_parallel_connections)))
-        {
-            g_debug("%s: Lower maximum of allowed parallel connections for this mirror", __func__);
-            if (has_running_transfers(target->mirror))
-                target->mirror->allowed_parallel_connections = target->mirror->running_transfers;
-            else
-                target->mirror->allowed_parallel_connections = 1;
-
-            // Give used mirror another chance
-            target->tried_mirrors = g_slist_remove(target->tried_mirrors, target->mirror);
-            num_of_tried_mirrors = g_slist_length(target->tried_mirrors);
-        }
-        // complete_url_in_path and target->baseurl doesn't have an alternatives like using
-        // mirrors, therefore they are handled differently
-        const char * complete_url_or_baseurl = complete_url_in_path ? target->target->path : target->target->baseurl;
-        if (can_retry_download(dd, num_of_tried_mirrors, complete_url_or_baseurl))
-        {
-          // Try another mirror or retry
-          if (complete_url_or_baseurl) {
-              g_debug("%s: Ignore error - Retry download", __func__);
-          } else {
-              g_debug("%s: Ignore error - Try another mirror", __func__);
-          }
-          target->state = LR_DS_WAITING;
-          retry = TRUE;
-
-          #ifdef WITH_ZCHUNK
-          if (!target->target->is_zchunk || target->zck_state == LR_ZCK_DL_HEADER) {
-          #endif
-            if (target->target->resume
-                && transfer_err->code == LRE_CURL
-                && target->headercb_state != LR_HCS_INTERRUPTED
-                && target->curl_code != CURLE_RANGE_ERROR)
-            {
-                // Connection error (timeout, recv error, etc.) with
-                // potentially valid partial data. Keep the data and
-                // let prepare_next_transfer() detect the offset from
-                // the current file size.
-                target->original_offset = -1;
-            } else {
-                // Server error (bad HTTP status), checksum mismatch,
-                // header callback interrupt, or range error — data is
-                // garbage. Truncate the file back to original_offset.
-                if (!truncate_transfer_file(target, err)) {
-                    g_error_free(transfer_err);
-                    return FALSE;
-                }
-            }
-          #ifdef WITH_ZCHUNK
-          }
-          #endif
-
-          g_error_free(transfer_err);  // Ignore the error
-        }
-    }
-
-    if (!retry) {
-        // No more mirrors to try or baseurl used or fatal error
-        g_debug("%s: No more retries (tried: %d)",
-                __func__, num_of_tried_mirrors);
-        target->state = LR_DS_FAILED;
-
-        // Call end callback
-        LrEndCb end_cb =  target->target->endcb;
-        if (end_cb) {
-            int rc = end_cb(target->target->cbdata,
-                            LR_TRANSFER_ERROR,
-                            transfer_err->message);
-            if (rc == LR_CB_ERROR) {
-                target->cb_return_code = LR_CB_ERROR;
-                target->target->cb_return_code = LR_CB_ERROR;
-                g_debug("%s: Downloading was aborted by LR_CB_ERROR "
-                        "from end callback", __func__);
-            }
-        }
-
-        lr_downloadtarget_set_error(target->target,
-                                    transfer_err->code,
-                                    "Download failed: %s",
-                                    transfer_err->message);
-        if (dd->failfast) {
-            // Fail fast is enabled, fail on any error
-            g_propagate_error(fail_fast_error, transfer_err);
-        } else if (target->cb_return_code == LR_CB_ERROR) {
-            // Callback returned LR_CB_ERROR, abort the downloading
-            g_debug("%s: Downloading was aborted by LR_CB_ERROR", __func__);
-            g_propagate_error(fail_fast_error, transfer_err);
-        } else {
-            // Fail fast is disabled and callback doesn't repor serious
-            // error, so this download is aborted, but other download
-            // can continue (do not abort whole downloading)
-            g_error_free(transfer_err);
-        }
-    }
-
-    return TRUE;
-}
-
-static gboolean
 check_transfer_statuses(LrDownload *dd, GError **err)
 {
     assert(dd);
@@ -2800,11 +2526,6 @@ check_transfer_statuses(LrDownload *dd, GError **err)
                     g_set_error(&transfer_err, LR_DOWNLOADER_ERROR, LRE_BADCHECKSUM,
                                 "At least one of the zchunk checksums doesn't match in %s",
                                 effective_url);
-                    // Record the failure so the "fully downloaded"
-                    // shortcut does not trust this file on the next
-                    // mirror attempt
-                    g_clear_error(&target->last_validate_err);
-                    target->last_validate_err = g_error_copy(transfer_err);
                     goto transfer_error;
                 }
                 zck_free(&zck);
@@ -2831,59 +2552,50 @@ check_transfer_statuses(LrDownload *dd, GError **err)
         if (transfer_err)  // Checksum doesn't match
             goto transfer_error;
 
-        //
-        // Any other checks should go here
-        //
-        #ifdef WITH_ZCHUNK
-        // Validate zchunk files only when they are fully downloaded
-        if (target->target->validatecb &&
-            (!target->target->is_zchunk || target->zck_state == LR_ZCK_DL_FINISHED)) {
-        #else
-        if (target->target->validatecb) {
-        #endif
-            GError *validate_err = NULL;
-            const char *mirror_url = target->mirror ? target->mirror->mirror->url : NULL;
-            // The callback may start a nested download (e.g. the GPG
-            // signature download). Let the nested session service this
-            // session's multi handle so the other running transfers
-            // keep making progress and their curl timeouts stay
-            // satisfied.
-            lr_download_push_parent(dd->multi_handle);
-            gboolean validate_ok = target->target->validatecb(target->target, mirror_url, &validate_err);
-            lr_download_pop_parent();
-            if (validate_ok) {
-                // A successful callback must not set an error - drop it defensively
-                g_clear_error(&validate_err);
-                target->validate_ok = TRUE;
-            }
-            if (!validate_ok) {
-                g_debug("%s: Validation failed: %s", effective_url,
-                        validate_err ? validate_err->message : "(no error message)");
-                if (!validate_err)
-                    g_set_error(&validate_err, LR_DOWNLOADER_ERROR, LRE_BADGPG,
-                               "Validation failed");
-                // Keep a copy - the error below is freed on retry, but the
-                // copy is used to report the most relevant error when all
-                // mirrors are exhausted
-                g_clear_error(&target->last_validate_err);
-                target->last_validate_err = g_error_copy(validate_err);
-                // Cancellation during validation (a user callback asked to
-                // stop, or the download was interrupted) is fatal: retrying
-                // on another mirror would violate the user's request
-                if (validate_err->code == LRE_INTERRUPTED ||
-                    validate_err->code == LRE_CBINTERRUPTED) {
-                    fatal_error = TRUE;
-                    if (validate_err->code == LRE_CBINTERRUPTED) {
-                        target->cb_return_code = LR_CB_ERROR;
-                        target->target->cb_return_code = LR_CB_ERROR;
-                    }
-                }
-                transfer_err = validate_err;
-                goto transfer_error;
-            }
+        if (target->target->gpg_signature) {
+            // Keep the pair in one mirror attempt, but schedule the signature
+            // normally so other repositories keep progressing in this loop.
+            LrDownloadTarget *data = target->target;
+            _cleanup_free_ char *path = g_strconcat(data->path, ".asc", NULL);
+            curl_multi_remove_handle(dd->multi_handle, target->transfer->curl_handle);
+            transfer_end(target);
+            dd->running_transfers = g_slist_remove(dd->running_transfers, target);
+            if (target->mirror)
+                target->mirror->running_transfers--;
+            target->data_effective_url = g_strdup(effective_url);
+            target->signed_target = data;
+            target->target = lr_downloadtarget_new(data->handle, path, data->baseurl,
+                    -1, data->gpg_signature, NULL, 0, FALSE,
+                    data->progresscb, data->cbdata, NULL, NULL, NULL,
+                    0, 0, NULL, TRUE, FALSE);
+            target->state = LR_DS_WAITING;
+            continue;
         }
 
 transfer_error:
+
+        if (target->signed_target) {
+            if (!transfer_err) {
+                // Both files are complete. Only verification, not network I/O,
+                // is performed synchronously in the completion handler.
+                lseek(fd, 0, SEEK_SET);
+                lseek(target->signed_target->fd, 0, SEEK_SET);
+                lr_gpg_check_signature_fd(fd, target->signed_target->fd,
+                        target->signed_target->gnupghomedir, &transfer_err);
+                if (transfer_err)
+                    g_prefix_error(&transfer_err, "repomd.xml GPG signature verification error: ");
+            } else if (!fatal_error) {
+                GError *download_error = transfer_err;
+                transfer_err = NULL;
+                g_set_error(&transfer_err, LR_DOWNLOADER_ERROR, LRE_BADGPG,
+                            "GPG signature is not available: %s", download_error->message);
+                g_error_free(download_error);
+            }
+            if (transfer_err && !fatal_error) {
+                g_clear_error(&target->last_gpg_error);
+                target->last_gpg_error = g_error_copy(transfer_err);
+            }
+        }
 
         //
         // Cleanup
@@ -2894,6 +2606,14 @@ transfer_error:
         // released here.
         curl_multi_remove_handle(dd->multi_handle, target->transfer->curl_handle);
         transfer_end(target);
+        if (target->signed_target) {
+            finish_signature(target, transfer_err == NULL);
+            if (!transfer_err) {
+                g_free(effective_url);
+                effective_url = g_steal_pointer(&target->data_effective_url);
+            }
+            g_clear_pointer(&target->data_effective_url, g_free);
+        }
 
         dd->running_transfers = g_slist_remove(dd->running_transfers,
                                                (gconstpointer) target);
@@ -2908,11 +2628,139 @@ transfer_error:
         }
 
         if (transfer_err) {  // There was an error during transfer
-            if (!handle_failed_transfer(dd, target, transfer_err,
-                                       serious_error, &fatal_error,
-                                       effective_url,
-                                       &fail_fast_error, err))
-                return FALSE;
+            int complete_url_in_path = strstr(target->target->path, "://") ? 1 : 0;
+            guint num_of_tried_mirrors = g_slist_length(target->tried_mirrors);
+            gboolean retry = FALSE;
+
+            g_info("Error during transfer: %s", transfer_err->message);
+
+            // Call mirrorfailure callback
+            LrMirrorFailureCb mf_cb =  target->target->mirrorfailurecb;
+            if (mf_cb) {
+                int rc = mf_cb(target->target->cbdata,
+                               transfer_err->message,
+                               effective_url);
+                if (rc == LR_CB_ABORT) {
+                    // User wants to abort this download, so make the error fatal
+                    fatal_error = TRUE;
+                } else if (rc == LR_CB_ERROR) {
+                    gchar *original_err_msg = g_strdup(transfer_err->message);
+                    g_clear_error(&transfer_err);
+                    g_info("Downloading was aborted by LR_CB_ERROR from "
+                           "mirror failure callback. Original error was: %s", original_err_msg);
+                    g_set_error(&transfer_err, LR_DOWNLOADER_ERROR, LRE_CBINTERRUPTED,
+                                "Downloading was aborted by LR_CB_ERROR from "
+                                "mirror failure callback. Original error was: "
+                                "%s", original_err_msg);
+                    g_free(original_err_msg);
+                    fatal_error = TRUE;
+                    target->cb_return_code = LR_CB_ERROR;
+                }
+            }
+
+            if (!fatal_error)
+            {
+                // Temporary error (serious_error) during download occurred and
+                // another transfers are running or there are successful transfers
+                // and fewer failed transfers than tried parallel connections. It may be mirror is OK
+                // but accepts fewer parallel connections.
+                if (serious_error && target->mirror &&
+                    (has_running_transfers(target->mirror) ||
+                      (target->mirror->successful_transfers > 0 &&
+                        target->mirror->failed_transfers < target->mirror->max_tried_parallel_connections)))
+                {
+                    g_debug("%s: Lower maximum of allowed parallel connections for this mirror", __func__);
+                    if (has_running_transfers(target->mirror))
+                        target->mirror->allowed_parallel_connections = target->mirror->running_transfers;
+                    else
+                        target->mirror->allowed_parallel_connections = 1;
+
+                    // Give used mirror another chance
+                    target->tried_mirrors = g_slist_remove(target->tried_mirrors, target->mirror);
+                    num_of_tried_mirrors = g_slist_length(target->tried_mirrors);
+                }
+                // complete_url_in_path and target->baseurl doesn't have an alternatives like using
+                // mirrors, therefore they are handled differently
+                const char * complete_url_or_baseurl = complete_url_in_path ? target->target->path : target->target->baseurl;
+                if (can_retry_download(dd, num_of_tried_mirrors, complete_url_or_baseurl))
+                {
+                  // Try another mirror or retry
+                  if (complete_url_or_baseurl) {
+                      g_debug("%s: Ignore error - Retry download", __func__);
+                  } else {
+                      g_debug("%s: Ignore error - Try another mirror", __func__);
+                  }
+                  target->state = LR_DS_WAITING;
+                  retry = TRUE;
+
+                  #ifdef WITH_ZCHUNK
+                  if (!target->target->is_zchunk || target->zck_state == LR_ZCK_DL_HEADER) {
+                  #endif
+                    if (target->target->resume
+                        && transfer_err->code == LRE_CURL
+                        && target->headercb_state != LR_HCS_INTERRUPTED
+                        && target->curl_code != CURLE_RANGE_ERROR)
+                    {
+                        // Connection error (timeout, recv error, etc.) with
+                        // potentially valid partial data. Keep the data and
+                        // let prepare_next_transfer() detect the offset from
+                        // the current file size.
+                        target->original_offset = -1;
+                    } else {
+                        // Server error (bad HTTP status), checksum mismatch,
+                        // header callback interrupt, or range error — data is
+                        // garbage. Truncate the file back to original_offset.
+                        if (!truncate_transfer_file(target, err)) {
+                            g_error_free(transfer_err);
+                            return FALSE;
+                        }
+                    }
+                  #ifdef WITH_ZCHUNK
+                  }
+                  #endif
+
+                  g_error_free(transfer_err);  // Ignore the error
+                }
+            }
+
+            if (!retry) {
+                // No more mirrors to try or baseurl used or fatal error
+                g_debug("%s: No more retries (tried: %d)",
+                        __func__, num_of_tried_mirrors);
+                target->state = LR_DS_FAILED;
+
+                // Call end callback
+                LrEndCb end_cb =  target->target->endcb;
+                if (end_cb) {
+                    int rc = end_cb(target->target->cbdata,
+                                    LR_TRANSFER_ERROR,
+                                    transfer_err->message);
+                    if (rc == LR_CB_ERROR) {
+                        target->cb_return_code = LR_CB_ERROR;
+                        g_debug("%s: Downloading was aborted by LR_CB_ERROR "
+                                "from end callback", __func__);
+                    }
+                }
+
+                lr_downloadtarget_set_error(target->target,
+                                            transfer_err->code,
+                                            "Download failed: %s",
+                                            transfer_err->message);
+                if (dd->failfast) {
+                    // Fail fast is enabled, fail on any error
+                    g_propagate_error(&fail_fast_error, transfer_err);
+                } else if (target->cb_return_code == LR_CB_ERROR) {
+                    // Callback returned LR_CB_ERROR, abort the downloading
+                    g_debug("%s: Downloading was aborted by LR_CB_ERROR", __func__);
+                    g_propagate_error(&fail_fast_error, transfer_err);
+                } else {
+                    // Fail fast is disabled and callback doesn't repor serious
+                    // error, so this download is aborted, but other download
+                    // can continue (do not abort whole downloading)
+                    g_error_free(transfer_err);
+                }
+            }
+
         } else {
             #ifdef WITH_ZCHUNK
             // No error encountered, transfer finished successfully
@@ -2943,7 +2791,6 @@ transfer_error:
                                     NULL);
                     if (rc == LR_CB_ERROR) {
                         target->cb_return_code = LR_CB_ERROR;
-                        target->target->cb_return_code = LR_CB_ERROR;
                         g_debug("%s: Downloading was aborted by LR_CB_ERROR "
                                 "from end callback", __func__);
                         g_set_error(&fail_fast_error, LR_DOWNLOADER_ERROR,
@@ -3035,22 +2882,6 @@ lr_perform(LrDownload *dd, GError **err)
             return FALSE;
         }
 
-        // A nested download must keep its parent sessions' transfers
-        // making progress (their curl timeouts are driven by wall
-        // clock): service their multi handles and wait no longer than
-        // they do.
-        for (int i = 0; i < dd->cooperative_multi_count; i++) {
-            CURLMcode p_rc = curl_multi_perform(dd->cooperative_multi[i], NULL);
-            if (p_rc != CURLM_OK)
-                g_debug("curl_multi_perform() on parent multi handle error: %s",
-                        curl_multi_strerror(p_rc));
-            long parent_timeout = -1;
-            if (curl_multi_timeout(dd->cooperative_multi[i], &parent_timeout) == CURLM_OK
-                && parent_timeout >= 0
-                && (curl_timeout < 0 || parent_timeout < curl_timeout))
-                curl_timeout = parent_timeout;
-        }
-
         if (curl_timeout <= 0) // No wait
             continue;
 
@@ -3118,18 +2949,25 @@ lr_download(GSList *targets,
         return TRUE;
     }
 
+    // Signed metadata is a whole-file, fd-backed download. In particular,
+    // do not expose a validation shortcut for cached zchunk or resumed data.
+    for (GSList *elem = targets; elem; elem = elem->next) {
+        LrDownloadTarget *target = elem->data;
+        if (target->gpg_signature &&
+            (target->fd < 0 || target->is_zchunk || target->resume ||
+             target->range || target->byterangestart || target->byterangeend)) {
+            g_set_error(err, LR_DOWNLOADER_ERROR, LRE_BADFUNCARG,
+                        "GPG checking requires a whole-file, non-zchunk, non-resuming fd target");
+            return FALSE;
+        }
+    }
+
     // XXX: Downloader configuration (max parallel connections etc.)
     // is taken from the handle of the first target.
     LrHandle *lr_handle = ((LrDownloadTarget *) targets->data)->handle;
 
     // Prepare download data
     dd.failfast = failfast;
-
-    // A nested download (started from a validation callback of an outer
-    // session) services the outer sessions' multi handles while it runs
-    dd.cooperative_multi_count = nested_parent_multis_count;
-    for (int i = 0; i < dd.cooperative_multi_count; i++)
-        dd.cooperative_multi[i] = nested_parent_multis[i];
 
     if (lr_handle) {
         dd.max_parallel_connections = lr_handle->maxparalleldownloads;
@@ -3181,9 +3019,6 @@ lr_download(GSList *targets,
         target->target->rcode   = LRE_UNFINISHED;
         target->target->err     = "Not finished";
         target->handle          = dtarget->handle;
-        // Without a validatecb, validation is trivially satisfied (it
-        // gates the "file already complete" shortcut for zchunk targets)
-        target->validate_ok     = (dtarget->validatecb == NULL);
         dd.targets = g_slist_append(dd.targets, target);
         // Add list of handle internal mirrors to dd.handle_mirrors
         // if doesn't exists yet and set the list reference
@@ -3214,6 +3049,7 @@ lr_download_cleanup:
 
             curl_multi_remove_handle(dd.multi_handle, target->transfer->curl_handle);
             transfer_end(target);
+            finish_signature(target, FALSE);
 
             // Call end callback
             LrEndCb end_cb =  target->target->endcb;
@@ -3258,6 +3094,9 @@ lr_download_cleanup:
         LrTarget *target = elem->data;
         // Every transfer has been ended by now, so nothing is left allocated
         assert(target->transfer == NULL);
+        finish_signature(target, FALSE);
+        g_free(target->data_effective_url);
+        g_clear_error(&target->last_gpg_error);
 
         // Remove file created for the target if download was
         // unsuccessful and the file doesn't exists before or
@@ -3276,7 +3115,6 @@ lr_download_cleanup:
         }
 
         g_slist_free(target->tried_mirrors);
-        g_clear_error(&target->last_validate_err);
         lr_free(target);
     }
     g_slist_free(dd.targets);
@@ -3308,7 +3146,7 @@ lr_download_target(LrDownloadTarget *target,
 gboolean
 lr_download_url(LrHandle *lr_handle, const char *url, int fd, GError **err)
 {
-    return lr_yum_download_url(lr_handle, url, fd, FALSE, FALSE, err, NULL);
+    return lr_yum_download_url(lr_handle, url, fd, FALSE, FALSE, err);
 }
 
 int

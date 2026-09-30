@@ -294,17 +294,7 @@ create_repomd_xml_download_targets(GSList *targets,
                                                     TRUE,
                                                     FALSE);
 
-            // GPG verification of repomd.xml is done per mirror by the
-            // download engine (see lr_yum_repomd_gpg_validate)
-            if (handle->checks & LR_CHECK_GPG) {
-                LrYumValidateData *data = g_new0(LrYumValidateData, 1);
-                data->repo = target->repo;
-                // Borrowed from the target's string chunk - the target
-                // outlives the download
-                data->gnupghomedir = target->gnupghomedir;
-                download_target->validatecb = lr_yum_repomd_gpg_validate;
-                download_target->validatecb_userdata = data;
-            }
+            lr_yum_repomd_setup_gpg(download_target, target->gnupghomedir);
 
             target->download_target = download_target;
             (*download_targets) = g_slist_append((*download_targets), download_target);
@@ -356,6 +346,7 @@ process_repomd_xml(GSList *targets,
 
         lr_free(handle->used_mirror);
         handle->used_mirror =  g_strdup(target->download_target->usedmirror);
+        target->repo->signature = g_strdup(target->download_target->gpg_signature);
 
         lseek(fd_value, 0, SEEK_SET);
         ret = lr_yum_repomd_parse_file(target->repomd, fd_value, lr_xml_parser_warning_logger,
@@ -395,9 +386,6 @@ lr_metadata_download_cleanup(GSList *download_targets)
             ret = FALSE;
         }
 
-        // Free the per-target GPG validation data (the callback has
-        // run by now)
-        g_free(download_target->validatecb_userdata);
         lr_downloadtarget_free(download_target);
     }
     g_slist_free(download_targets);
@@ -632,6 +620,14 @@ lr_download_metadata(GSList *targets,
     create_repomd_xml_download_targets(targets, &download_targets, &fd_list, &paths);
 
     if (!lr_download(download_targets, FALSE, err)) {
+        // process_repomd_xml normally owns these; cancellation skips it.
+        for (GSList *elem = fd_list; elem; elem = elem->next) {
+            int fd = *(int *) elem->data;
+            if (fd != -1)
+                close(fd);
+        }
+        g_slist_free_full(fd_list, g_free);
+        g_slist_free_full(paths, g_free);
         restore_handle_callbacks(targets, handle_callbacks_backups);
         return cleanup(download_targets, err);
     }

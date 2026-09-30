@@ -430,120 +430,19 @@ lr_prepare_repomd_xml_file(LrHandle *handle,
     return fd;
 }
 
-/** Post-download validation callback for repomd.xml with GPG check
- * enabled.
- *
- * Verifies the GPG signature (repomd.xml.asc) of the downloaded
- * repomd.xml. The signature is downloaded from the same mirror that
- * provided repomd.xml, so the pair is always consistent. If the
- * signature is missing or invalid, the callback fails and the download
- * engine treats the mirror as failed and tries the next mirror
- * (https://github.com/rpm-software-management/librepo/issues/415).
- *
- * On success, repo->signature is set to the local path of the
- * downloaded repomd.xml.asc.
- */
-gboolean
-lr_yum_repomd_gpg_validate(LrDownloadTarget *target,
-                           const char *mirror_url,
-                           GError **err)
+/* Both repository APIs use the same two-phase mirror attempt in the downloader.
+ * Keep the per-target keyring independent of the shared handle. */
+void
+lr_yum_repomd_setup_gpg(LrDownloadTarget *target, const char *gnupghomedir)
 {
     LrHandle *handle = target->handle;
-    LrYumValidateData *data = target->validatecb_userdata;
-    LrYumRepo *repo = data->repo;
-    // The target's GPG home directory wins over the handle's (which
-    // may be shared by multiple targets with different keyrings)
-    const char *gnupghomedir = data->gnupghomedir ? data->gnupghomedir
-                                                 : handle->gnupghomedir;
-    GError *tmp_err = NULL;
-    gboolean ret;
-
-    assert(!err || *err == NULL);
-    assert(handle);
-    assert(data);
-    assert(repo);
-
-    if (!mirror_url) {
-        // The target used a base URL instead of a mirror - the pair
-        // stays consistent, the base URL is the only source
-        mirror_url = target->baseurl;
-    }
-    if (!mirror_url) {
-        // No mirror and no base URL - there is nothing to download
-        // the signature from
-        g_set_error(err, LR_YUM_ERROR, LRE_BADGPG,
-                    "GPG verification is enabled, but the mirror is "
-                    "not known, cannot verify repomd.xml");
-        return FALSE;
-    }
-
-    // Download repomd.xml.asc from the same mirror that provided repomd.xml
-    char *signature = lr_pathconcat(handle->destdir, "repodata/repomd.xml.asc", NULL);
-    int fd_sig = open(signature, O_CREAT | O_TRUNC | O_RDWR, 0666);
-    if (fd_sig == -1) {
-        g_debug("%s: Cannot open: %s", __func__, signature);
-        g_set_error(err, LR_YUM_ERROR, LRE_IO,
-                    "Cannot open %s: %s", signature, g_strerror(errno));
-        g_free(signature);
-        return FALSE;
-    }
-    char *url = lr_pathconcat(mirror_url, "repodata/repomd.xml.asc", NULL);
-    LrCbReturnCode cb_code = LR_CB_OK;
-    ret = lr_yum_download_url(handle, url, fd_sig, TRUE, FALSE, &tmp_err, &cb_code);
-    g_free(url);
-    close(fd_sig);
-    if (!ret) {
-        // Error downloading signature
-        g_debug("%s: Cannot download repomd.xml.asc from %s: %s",
-                __func__, mirror_url, tmp_err->message);
-        if (tmp_err->code == LRE_INTERRUPTED) {
-            // Do not mask an interrupt as a GPG error
-            g_propagate_error(err, tmp_err);
-        } else if (tmp_err->code == LRE_CBINTERRUPTED ||
-                   (tmp_err->code == LRE_CURL && cb_code == LR_CB_ERROR)) {
-            // The user's callback asked to stop (a progress callback
-            // returning LR_CB_ERROR aborts the nested download and is
-            // reported as a curl abort). Do not mask the cancellation
-            // as a GPG error - the download engine must stop, not
-            // retry the next mirror.
-            g_set_error(err, LR_YUM_ERROR, LRE_CBINTERRUPTED,
-                        "GPG signature download was interrupted by a "
-                        "callback: %s", tmp_err->message);
-            g_clear_error(&tmp_err);
-        } else {
-            g_set_error(err, LR_YUM_ERROR, LRE_BADGPG,
-                        "GPG verification is enabled, but GPG signature "
-                        "is not available. This may be an error or the "
-                        "repository does not support GPG verification: %s",
-                        tmp_err->message);
-            g_clear_error(&tmp_err);
-        }
-        unlink(signature);
-        g_free(signature);
-        return FALSE;
-    }
-
-    // Verify the GPG signature
-    char *repomd_path = lr_pathconcat(handle->destdir, target->path, NULL);
-    ret = lr_gpg_check_signature(signature, repomd_path,
-                                 gnupghomedir, &tmp_err);
-    g_free(repomd_path);
-    if (!ret) {
-        g_debug("%s: GPG signature verification failed from %s: %s",
-                __func__, mirror_url, tmp_err->message);
-        g_propagate_prefixed_error(err, tmp_err,
-                                   "repomd.xml GPG signature verification error: ");
-        unlink(signature);
-        g_free(signature);
-        return FALSE;
-    }
-
-    // Success - record the local path of the verified signature
-    g_debug("%s: GPG signature successfully verified from %s",
-            __func__, mirror_url);
-    repo->signature = g_strdup(signature);
-    g_free(signature);
-    return TRUE;
+    if (!(handle->checks & LR_CHECK_GPG))
+        return;
+    _cleanup_free_ char *signature = lr_pathconcat(handle->destdir,
+                                                  "repodata/repomd.xml.asc", NULL);
+    target->gpg_signature = g_string_chunk_insert(target->chunk, signature);
+    target->gnupghomedir = lr_string_chunk_insert(target->chunk,
+                            gnupghomedir ? gnupghomedir : handle->gnupghomedir);
 }
 
 void
@@ -596,8 +495,7 @@ lr_get_metadata_failure_callback(const LrHandle *handle)
 
 gboolean
 lr_yum_download_url(LrHandle *lr_handle, const char *url, int fd,
-                    gboolean no_cache, gboolean is_zchunk,
-                    GError **err, LrCbReturnCode *cb_return_code)
+                    gboolean no_cache, gboolean is_zchunk, GError **err)
 {
     gboolean ret;
     LrDownloadTarget *target;
@@ -628,9 +526,6 @@ lr_yum_download_url(LrHandle *lr_handle, const char *url, int fd,
     assert(!(target->err) || !ret);
     if (cbdata)
         cbdata_free(cbdata);
-
-    if (cb_return_code)
-        *cb_return_code = target->cb_return_code;
 
     if (!ret)
         g_propagate_error(err, tmp_err);
@@ -686,24 +581,13 @@ lr_yum_download_repomd(LrHandle *handle,
                                                      TRUE,
                                                      FALSE);
 
-    // GPG verification of repomd.xml is done per mirror by the download
-    // engine - a mirror with a missing or invalid repomd.xml.asc is
-    // skipped and the next mirror is tried
-    if (handle->checks & LR_CHECK_GPG) {
-        LrYumValidateData *data = g_new0(LrYumValidateData, 1);
-        data->repo = repo;
-        target->validatecb = lr_yum_repomd_gpg_validate;
-        target->validatecb_userdata = data;
-    }
+    lr_yum_repomd_setup_gpg(target, NULL);
 
     ret = lr_download_target(target, &tmp_err);
     assert((ret && !tmp_err) || (!ret && tmp_err));
 
     if (cbdata)
         cbdata_free(cbdata);
-
-    // The callback has run by now - free the per-target data
-    g_free(target->validatecb_userdata);
 
     if (tmp_err) {
         g_propagate_prefixed_error(err, tmp_err,
@@ -718,6 +602,7 @@ lr_yum_download_repomd(LrHandle *handle,
         // TODO: Get rid of use_mirror attr
         lr_free(handle->used_mirror);
         handle->used_mirror = g_strdup(target->usedmirror);
+        repo->signature = g_strdup(target->gpg_signature);
     }
 
     lr_downloadtarget_free(target);
@@ -1465,8 +1350,7 @@ lr_yum_download_remote(LrHandle *handle, LrResult *result, GError **err)
         if ((fd = lr_prepare_repomd_xml_file(handle, &path, err)) == -1)
             return FALSE;
 
-        /* Download repomd.xml (and verify its GPG signature per mirror
-         * when enabled) */
+        /* Download and verify the signed pair in one mirror attempt. */
         ret = lr_yum_download_repomd(handle, repo, handle->metalink, fd, err);
         if (!ret) {
             close(fd);

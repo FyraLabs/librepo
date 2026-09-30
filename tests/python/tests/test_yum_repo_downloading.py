@@ -1,4 +1,5 @@
 import sys
+import ctypes
 import time
 import shutil
 import os.path
@@ -7,7 +8,7 @@ import unittest
 
 import librepo
 
-from tests.base import Context, TestCaseWithServer, TEST_DATA
+from tests.base import TestCaseWithServer, TEST_DATA
 import tests.servermock.yum_mock.config as config
 
 PUB_KEY = TEST_DATA+"/key.pub"
@@ -21,8 +22,11 @@ class TestCaseYumRepoDownloading(TestCaseWithServer):
         gpghome = os.path.join(self.tmpdir, "keyring")
         os.mkdir(gpghome, 0o700)
         os.environ['GNUPGHOME'] = gpghome
-        self.ctx = Context()
-        self.ctx.op_import(open(PUB_KEY, 'rb'))
+        # Import through the backend under test (GPGME or RPM), not python-gpg.
+        import_key = ctypes.CDLL(librepo._librepo.__file__).lr_gpg_import_key
+        import_key.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p]
+        import_key.restype = ctypes.c_int
+        self.assertTrue(import_key(os.fsencode(PUB_KEY), os.fsencode(gpghome), None))
 
     def tearDown(self):
         if self._gnupghome is None:
@@ -770,6 +774,7 @@ class TestCaseYumRepoDownloading(TestCaseWithServer):
         h.repotype = librepo.LR_YUMREPO
         h.destdir = self.tmpdir
         h.gpgcheck = True
+        h.gnupghomedir = os.environ['GNUPGHOME']
         h.perform(r)
 
         yum_repo   = r.getinfo(librepo.LRR_YUM_REPO)
@@ -790,6 +795,7 @@ class TestCaseYumRepoDownloading(TestCaseWithServer):
         h.repotype = librepo.LR_YUMREPO
         h.destdir = self.tmpdir
         h.gpgcheck = True
+        h.gnupghomedir = os.environ['GNUPGHOME']
 
         target = librepo.MetadataTarget(h, None, None, None, None, None)
         librepo.download_metadata([target])
@@ -811,8 +817,62 @@ class TestCaseYumRepoDownloading(TestCaseWithServer):
         target = librepo.MetadataTarget(h, None, None, None, None, None)
         librepo.download_metadata([target])
 
-        self.assertIsNotNone(target.err)
-        self.assertTrue(any("GPG" in e for e in target.err), target.err)
+        errors = target.err
+        self.assertIsNotNone(errors)
+        self.assertTrue(any("GPG" in e for e in errors), errors)
+        # The getter returns a new tuple, without leaking an extra reference.
+        reference = tuple(list(errors))
+        self.assertEqual(sys.getrefcount(errors), sys.getrefcount(reference))
+
+    def test_metadata_missing_signature_retry_and_abort(self):
+        good = self.MOCKURL + config.REPO_YUM_01_PATH
+        missing = (self.MOCKURL + config.MISSINGFILE % "repomd.xml.asc"
+                   + config.REPO_YUM_01_PATH)
+        for abort in (False, True):
+            with self.subTest(abort=abort):
+                h = librepo.Handle()
+                h.urls = [missing, good]
+                h.destdir = os.path.join(self.tmpdir, str(abort))
+                h.repotype = librepo.LR_YUMREPO
+                h.gpgcheck = True
+                h.gnupghomedir = os.environ['GNUPGHOME']
+                h.yumdlist = []
+                h.maxparalleldownloads = 1
+                h.maxmirrortries = 2
+                failures = []
+                def failed(data, message, url):
+                    failures.append(url)
+                    return librepo.LR_CB_ERROR if abort else librepo.LR_CB_OK
+                target = librepo.MetadataTarget(h, None, None, failed, None, None)
+                if abort:
+                    with self.assertRaises(librepo.LibrepoException) as exc:
+                        librepo.download_metadata([target])
+                    self.assertEqual(exc.exception.args[0], librepo.LRE_CBINTERRUPTED)
+                    self.assertFalse(os.path.exists(h.destdir + "/repodata/repomd.xml.asc"))
+                else:
+                    librepo.download_metadata([target])
+                    self.assertIsNone(target.err)
+                    self.assertTrue(os.path.isfile(h.destdir + "/repodata/repomd.xml.asc"))
+                self.assertEqual(failures, [missing.rstrip("/") + "/repodata/repomd.xml.asc"])
+
+    def test_metadata_gpg_uses_target_keyring_without_changing_handle(self):
+        empty = os.path.join(self.tmpdir, "empty-keyring")
+        os.mkdir(empty, 0o700)
+        trusted = os.environ['GNUPGHOME']
+        for valid in (True, False):
+            with self.subTest(valid=valid):
+                h = librepo.Handle()
+                h.urls = [self.MOCKURL + config.REPO_YUM_01_PATH]
+                h.destdir = os.path.join(self.tmpdir, "keyring-test-" + str(valid))
+                h.repotype = librepo.LR_YUMREPO
+                h.gpgcheck = True
+                h.yumdlist = []
+                h.gnupghomedir = empty if valid else trusted
+                target = librepo.MetadataTarget(h, None, None, None, None,
+                                                trusted if valid else empty)
+                librepo.download_metadata([target])
+                self.assertEqual(target.err is None, valid)
+                self.assertEqual(h.gnupghomedir, empty if valid else trusted)
 
     def test_download_repo_with_gpg_check_cancel_during_signature_download(self):
         # A progress callback returning LR_CB_ERROR during the
@@ -850,8 +910,8 @@ class TestCaseYumRepoDownloading(TestCaseWithServer):
     def test_download_metadata_with_gpg_check_concurrent_slow_signature(self):
         # A slow repomd.xml.asc download (the GPG check) must not stall
         # the other repositories' transfers in the same download session -
-        # the nested signature download must keep the outer download
-        # engine progressing (https://github.com/rpm-software-management/
+        # signature transfers must share the ordinary download loop
+        # (https://github.com/rpm-software-management/
         # librepo/issues/415)
         #
         # Repo A serves its repomd.xml.asc with a 2 second delay. Repo B
@@ -868,10 +928,10 @@ class TestCaseYumRepoDownloading(TestCaseWithServer):
         if not shutil.which("openssl"):
             self.skipTest("openssl is not available")
 
-        repomd = open(os.path.join(TEST_DATA, "repo_yum_01/repodata/repomd.xml"),
-                      "rb").read()
-        signature = open(os.path.join(TEST_DATA, "repo_yum_01/repodata/repomd.xml.asc"),
-                         "rb").read()
+        with open(os.path.join(TEST_DATA, "repo_yum_01/repodata/repomd.xml"), "rb") as f:
+            repomd = f.read()
+        with open(os.path.join(TEST_DATA, "repo_yum_01/repodata/repomd.xml.asc"), "rb") as f:
+            signature = f.read()
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -923,6 +983,7 @@ class TestCaseYumRepoDownloading(TestCaseWithServer):
             h_a.destdir = os.path.join(self.tmpdir, "a")
             h_a.repotype = librepo.LR_YUMREPO
             h_a.gpgcheck = True
+            h_a.gnupghomedir = os.environ['GNUPGHOME']
             h_a.yumdlist = []
             h_a.connecttimeout = 10
             # The session takes its config from the first target's handle
@@ -933,6 +994,7 @@ class TestCaseYumRepoDownloading(TestCaseWithServer):
             h_b.destdir = os.path.join(self.tmpdir, "b")
             h_b.repotype = librepo.LR_YUMREPO
             h_b.gpgcheck = True
+            h_b.gnupghomedir = os.environ['GNUPGHOME']
             h_b.yumdlist = []
             h_b.connecttimeout = 1
             h_b.maxmirrortries = 1

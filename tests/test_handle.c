@@ -11,6 +11,7 @@
 #include "librepo/rcodes.h"
 #include "librepo/handle.h"
 #include "librepo/url_substitution.h"
+#include "librepo/cleanup.h"
 
 #include "fixtures.h"
 #include "testsys.h"
@@ -195,184 +196,61 @@ START_TEST(test_handle_maxmirrortries)
 }
 END_TEST
 
-/** Copy a directory recursively (used to build test repositories)
- */
-static void
-test_copy_dir(const char *src, const char *dst)
-{
-    char *cmd = g_strdup_printf("cp -r '%s' '%s'", src, dst);
-    gchar *stdout_ = NULL, *stderr_ = NULL;
-    gint exit_status = 0;
-    gboolean ret = g_spawn_command_line_sync(cmd, &stdout_, &stderr_, &exit_status, NULL);
-    g_free(cmd);
-    ck_assert_msg(ret, "cp -r spawn failed");
-    ck_assert_msg(exit_status == 0, "cp -r failed: %s",
-                  stderr_ ? stderr_ : "");
-    g_free(stdout_);
-    g_free(stderr_);
-}
-
+/* _i == 0: all mirrors fail. _i == 1: retry the complete pair on a good
+ * mirror. The bad repomd is longer, so retry must also truncate its contents. */
 START_TEST(test_handle_gpgcheck_mirror_retry)
 {
-    // https://github.com/rpm-software-management/librepo/issues/415
-    // When GPG verification of repomd.xml fails on a mirror, the next
-    // mirror should be tried instead of failing the whole download.
+    GError *err = NULL;
+    _cleanup_free_ char *source = g_canonicalize_filename(test_globals.testdata_dir, NULL);
+    _cleanup_free_ char *good = lr_pathconcat(source, "repo_yum_01", NULL);
+    _cleanup_free_ char *bad = g_strdup_printf("%s/bad-gpg-%d", test_globals.tmpdir, _i);
+    _cleanup_free_ char *repodata = lr_pathconcat(bad, "repodata", NULL);
+    _cleanup_free_ char *home = g_strdup_printf("%s/keyring-%d", test_globals.tmpdir, _i);
+    _cleanup_free_ char *dest = g_strdup_printf("%s/gpg-dest-%d", test_globals.tmpdir, _i);
+    ck_assert_int_eq(g_mkdir_with_parents(repodata, 0700), 0);
+    ck_assert_int_eq(g_mkdir_with_parents(home, 0700), 0);
+    ck_assert_int_eq(g_mkdir_with_parents(dest, 0700), 0);
 
-    LrHandle *h = NULL;
-    LrResult *r = NULL;
-    GError *tmp_err = NULL;
-    char *gnupg_home = NULL;
-    char *testdata = NULL;
-    char *key_path = NULL;
-    char *bad_repo = NULL;
-    char *bad_sig_src = NULL;
-    char *bad_sig_dst = NULL;
-    char *good_repo = NULL;
-    char *urls[3] = {NULL, NULL, NULL};
-    gchar *bad_sig_content = NULL;
-    gsize bad_sig_len = 0;
+    _cleanup_free_ char *key = lr_pathconcat(good, "repodata/repomd.xml.key.asc", NULL);
+    ck_assert(lr_gpg_import_key(key, home, &err));
+    _cleanup_free_ char *src = lr_pathconcat(good, "repodata/repomd.xml", NULL);
+    _cleanup_free_ char *dst = lr_pathconcat(repodata, "repomd.xml", NULL);
+    _cleanup_free_ char *content = NULL;
+    ck_assert(g_file_get_contents(src, &content, NULL, &err));
+    _cleanup_free_ char *modified = g_strconcat(content, "\n<!-- out of sync -->\n", NULL);
+    ck_assert(g_file_set_contents(dst, modified, -1, &err));
+    _cleanup_free_ char *sig_src = lr_pathconcat(good, "repodata/repomd.xml.asc", NULL);
+    _cleanup_free_ char *sig_dst = lr_pathconcat(repodata, "repomd.xml.asc", NULL);
+    ck_assert_int_eq(symlink(sig_src, sig_dst), 0);
 
-    // file:// URLs must be absolute, canonicalize the test data dir
-    testdata = g_canonicalize_filename(test_globals.testdata_dir, NULL);
-    ck_assert_ptr_nonnull(testdata);
-
-    // Import the test public key into a temporary GPG home
-    gnupg_home = lr_gettmpdir();
-    ck_assert_ptr_nonnull(gnupg_home);
-    key_path = lr_pathconcat(testdata,
-                             "repo_yum_01/repodata/repomd.xml.key.asc", NULL);
-    ck_assert(lr_gpg_import_key(key_path, gnupg_home, &tmp_err));
-    ck_assert_ptr_null(tmp_err);
-
-    // Create a "bad" repository: a copy of repo_yum_01 whose
-    // repomd.xml.asc does not verify (signed by an unknown key)
-    bad_repo = lr_pathconcat(test_globals.tmpdir, "repo_badgpg", NULL);
-    test_copy_dir(lr_pathconcat(testdata, "repo_yum_01", NULL),
-                  bad_repo);
-    bad_sig_src = lr_pathconcat(testdata,
-                               "repo_yum_01/repodata/repomd.xml_bad.sig", NULL);
-    bad_sig_dst = lr_pathconcat(bad_repo, "repodata/repomd.xml.asc", NULL);
-    // overwrite the good signature with the bad one
-    ck_assert(g_file_get_contents(bad_sig_src, &bad_sig_content, &bad_sig_len, &tmp_err));
-    ck_assert(g_file_set_contents(bad_sig_dst, bad_sig_content, bad_sig_len, &tmp_err));
-    g_free(bad_sig_content);
-
-    good_repo = lr_pathconcat(testdata, "repo_yum_01", NULL);
-
-    h = lr_handle_init();
-    ck_assert_ptr_nonnull(h);
-    urls[0] = g_strdup_printf("file://%s", bad_repo);
-    urls[1] = g_strdup_printf("file://%s", good_repo);
-    ck_assert(lr_handle_setopt(h, &tmp_err, LRO_URLS, urls));
-    ck_assert_ptr_null(tmp_err);
-    ck_assert(lr_handle_setopt(h, &tmp_err, LRO_REPOTYPE, LR_YUMREPO));
-    ck_assert(lr_handle_setopt(h, &tmp_err, LRO_DESTDIR, test_globals.tmpdir));
-    ck_assert(lr_handle_setopt(h, &tmp_err, LRO_GPGCHECK, 1L));
-    ck_assert(lr_handle_setopt(h, &tmp_err, LRO_GNUPGHOMEDIR, gnupg_home));
-
-    r = lr_result_init();
-    ck_assert_ptr_nonnull(r);
-
-    // Before the fix: fails, because the GPG check was done only for the
-    // mirror that provided repomd.xml. After the fix: succeeds, because
-    // the second (good) mirror is tried.
-    ck_assert_msg(lr_handle_perform(h, r, &tmp_err),
-                  "GPG check should retry the next mirror: %s",
-                  tmp_err ? tmp_err->message : "");
-    ck_assert_ptr_null(tmp_err);
-
-    // The verified signature must have been downloaded
-    LrYumRepo *yum_repo = NULL;
-    ck_assert(lr_result_getinfo(r, &tmp_err, LRR_YUM_REPO, &yum_repo));
-    ck_assert_ptr_nonnull(yum_repo);
-    ck_assert_ptr_nonnull(yum_repo->signature);
-
-    // The used mirror must be the good one
-    ck_assert(yum_repo->url && g_str_has_suffix(yum_repo->url, "repo_yum_01"));
-
+    _cleanup_free_ char *bad_url = g_strconcat("file://", bad, NULL);
+    _cleanup_free_ char *good_url = g_strconcat("file://", good, NULL);
+    char *urls[] = {bad_url, _i ? good_url : NULL, NULL};
+    char *dlist[] = {NULL};
+    LrHandle *h = lr_handle_init();
+    ck_assert(lr_handle_setopt(h, &err, LRO_URLS, urls));
+    ck_assert(lr_handle_setopt(h, &err, LRO_DESTDIR, dest));
+    ck_assert(lr_handle_setopt(h, &err, LRO_REPOTYPE, LR_YUMREPO));
+    ck_assert(lr_handle_setopt(h, &err, LRO_YUMDLIST, dlist));
+    ck_assert(lr_handle_setopt(h, &err, LRO_GPGCHECK, 1L));
+    ck_assert(lr_handle_setopt(h, &err, LRO_GNUPGHOMEDIR, home));
+    ck_assert(lr_handle_setopt(h, &err, LRO_MAXMIRRORTRIES, 2L));
+    LrResult *r = lr_result_init();
+    gboolean ret = lr_handle_perform(h, r, &err);
+    ck_assert_msg(ret == _i, "Unexpected GPG result: %s", err ? err->message : "success");
+    if (_i) {
+        LrYumRepo *repo = NULL;
+        ck_assert_ptr_null(err);
+        ck_assert(lr_result_getinfo(r, &err, LRR_YUM_REPO, &repo));
+        ck_assert_ptr_nonnull(repo->signature);
+        ck_assert_str_eq(repo->url, good_url);
+    } else {
+        ck_assert_ptr_nonnull(err);
+        ck_assert_int_eq(err->code, LRE_BADGPG);
+    }
+    g_clear_error(&err);
     lr_result_free(r);
     lr_handle_free(h);
-    g_free(urls[0]);
-    g_free(urls[1]);
-    g_free(gnupg_home);
-    g_free(testdata);
-    g_free(key_path);
-    g_free(bad_repo);
-    g_free(bad_sig_src);
-    g_free(bad_sig_dst);
-    g_free(good_repo);
-}
-END_TEST
-
-START_TEST(test_handle_gpgcheck_single_bad_mirror)
-{
-    // Regression guard: with a single mirror whose repomd.xml.asc does not
-    // verify, the GPG check must still fail (no behavior change).
-
-    LrHandle *h = NULL;
-    LrResult *r = NULL;
-    GError *tmp_err = NULL;
-    char *gnupg_home = NULL;
-    char *testdata = NULL;
-    char *key_path = NULL;
-    char *bad_repo = NULL;
-    char *bad_sig_src = NULL;
-    char *bad_sig_dst = NULL;
-    char *urls[2] = {NULL, NULL};
-    char *destdir = NULL;
-    gchar *bad_sig_content = NULL;
-    gsize bad_sig_len = 0;
-
-    testdata = g_canonicalize_filename(test_globals.testdata_dir, NULL);
-    ck_assert_ptr_nonnull(testdata);
-
-    gnupg_home = lr_gettmpdir();
-    ck_assert_ptr_nonnull(gnupg_home);
-    key_path = lr_pathconcat(testdata,
-                             "repo_yum_01/repodata/repomd.xml.key.asc", NULL);
-    ck_assert(lr_gpg_import_key(key_path, gnupg_home, &tmp_err));
-    ck_assert_ptr_null(tmp_err);
-
-    bad_repo = lr_pathconcat(test_globals.tmpdir, "repo_badgpg2", NULL);
-    test_copy_dir(lr_pathconcat(testdata, "repo_yum_01", NULL),
-                  bad_repo);
-    bad_sig_src = lr_pathconcat(testdata,
-                               "repo_yum_01/repodata/repomd.xml_bad.sig", NULL);
-    bad_sig_dst = lr_pathconcat(bad_repo, "repodata/repomd.xml.asc", NULL);
-    ck_assert(g_file_get_contents(bad_sig_src, &bad_sig_content, &bad_sig_len, &tmp_err));
-    ck_assert(g_file_set_contents(bad_sig_dst, bad_sig_content, bad_sig_len, &tmp_err));
-    g_free(bad_sig_content);
-
-    h = lr_handle_init();
-    ck_assert_ptr_nonnull(h);
-    urls[0] = g_strdup_printf("file://%s", bad_repo);
-    ck_assert(lr_handle_setopt(h, &tmp_err, LRO_URLS, urls));
-    ck_assert_ptr_null(tmp_err);
-    ck_assert(lr_handle_setopt(h, &tmp_err, LRO_REPOTYPE, LR_YUMREPO));
-    destdir = lr_pathconcat(test_globals.tmpdir, "destdir2", NULL);
-    if (mkdir(destdir, S_IRWXU) == -1 && errno != EEXIST)
-        ck_abort_msg("Cannot create destdir");
-    ck_assert(lr_handle_setopt(h, &tmp_err, LRO_DESTDIR, destdir));
-    ck_assert(lr_handle_setopt(h, &tmp_err, LRO_GPGCHECK, 1L));
-    ck_assert(lr_handle_setopt(h, &tmp_err, LRO_GNUPGHOMEDIR, gnupg_home));
-
-    r = lr_result_init();
-    ck_assert_ptr_nonnull(r);
-
-    ck_assert(!lr_handle_perform(h, r, &tmp_err));
-    ck_assert_ptr_nonnull(tmp_err);
-    ck_assert_int_eq(tmp_err->code, LRE_BADGPG);
-
-    lr_result_free(r);
-    lr_handle_free(h);
-    g_free(urls[0]);
-    g_free(destdir);
-    g_free(gnupg_home);
-    g_free(testdata);
-    g_free(key_path);
-    g_free(bad_repo);
-    g_free(bad_sig_src);
-    g_free(bad_sig_dst);
 }
 END_TEST
 
@@ -384,8 +262,7 @@ handle_suite(void)
     tcase_add_test(tc, test_handle);
     tcase_add_test(tc, test_handle_getinfo);
     tcase_add_test(tc, test_handle_maxmirrortries);
-    tcase_add_test(tc, test_handle_gpgcheck_mirror_retry);
-    tcase_add_test(tc, test_handle_gpgcheck_single_bad_mirror);
+    tcase_add_loop_test(tc, test_handle_gpgcheck_mirror_retry, 0, 2);
     suite_add_tcase(s, tc);
     return s;
 }
