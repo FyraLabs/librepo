@@ -340,7 +340,13 @@ process_repomd_xml(GSList *targets,
         }
 
         if (target->download_target->rcode != LRE_OK) {
-            lr_metadatatarget_append_error(target, "%s", lr_strerror(target->download_target->rcode));
+            // Propagate the detailed error message (e.g. "Signing key not
+            // found" from GPG verification) so callers can react to specific
+            // failures; fall back to the return code string.
+            if (target->download_target->err)
+                lr_metadatatarget_append_error(target, "%s", target->download_target->err);
+            else
+                lr_metadatatarget_append_error(target, "%s", lr_strerror(target->download_target->rcode));
             goto fail;
         }
 
